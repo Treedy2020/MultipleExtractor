@@ -1,10 +1,23 @@
 """DOCX文档信息提取工具。
 
-使用OpenAI结构化输出提取文档中的特定字段。支持从单个文档中提取多条记录（例如表格的多行数据）。
+使用OpenAI结构化输出提取文档中的特定字段。支持从单个文档中提取多条记录（例如表格的多行数据），
+以及批量处理文件夹中的多个文档。
+
+Features:
+    - 单文件处理：提取单个DOCX文档中的结构化信息
+    - 批量处理：处理文件夹中的所有DOCX文件
+    - 多格式导出：支持JSON和CSV格式输出
+    - 多记录提取：自动识别文档中的多行数据
 
 Typical usage example:
+    # 处理单个文件
     python main.py document.docx
     python main.py document.docx -o output.json
+
+    # 批量处理文件夹，导出为CSV
+    python main.py ./documents -o results.csv
+
+    # 使用自定义API配置
     python main.py document.docx --api-key your-api-key --model gpt-4o
     python main.py document.docx --api-base https://api.openai.com/v1
 
@@ -14,10 +27,13 @@ Environment variables:
     OPENAI_MODEL: 使用的模型名称（默认: gpt-4o-2024-08-06）
 
 Note:
-    文档中的每一行数据都会被提取为一个单独的记录，所有记录会以列表形式返回。
+    - 文档中的每一行数据都会被提取为一个单独的记录，所有记录会以列表形式返回
+    - 批量处理文件夹时，建议使用CSV格式以便整合所有文件的结果
+    - CSV输出会包含源文件名，方便追踪每条记录的来源
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -143,9 +159,9 @@ class DocxExtractor:
             openai.APIError: 如果API调用失败。
             openai.RateLimitError: 如果超出API速率限制。
         """
-        completion = self.client.beta.chat.completions.parse(
+        completion = self.client.responses.parse(
             model=self.model,
-            messages=[
+            input=[
                 {
                     "role": "system",
                     "content": """你是一个专业的文档信息提取助手。请从提供的文档内容中提取以下字段：
@@ -168,11 +184,49 @@ class DocxExtractor:
                     "content": f"请从以下文档内容中提取所有行的信息：\n\n{text}"
                 }
             ],
-            response_format=DocumentExtraction,
+            text_format=DocumentExtraction,
         )
 
-        return completion.choices[0].message.parsed
-    
+        return completion.output_parsed
+
+    @staticmethod
+    def export_to_csv(extractions: list[tuple[str, DocumentExtraction]], output_path: str) -> None:
+        """将多个提取结果导出为CSV文件。
+
+        Args:
+            extractions: 包含 (文件名, DocumentExtraction) 元组的列表。
+            output_path: CSV输出文件路径。
+
+        Raises:
+            IOError: 如果无法写入文件。
+        """
+        with open(output_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+
+            # 写入表头
+            writer.writerow([
+                'Source File',
+                'TL EA',
+                'Test Standard',
+                'Test Analytes',
+                'PP Notes',
+                'Source Link',
+                'Label and Symbol'
+            ])
+
+            # 写入每个文件的所有记录
+            for filename, extraction in extractions:
+                for record in extraction.records:
+                    writer.writerow([
+                        filename,
+                        record.tl_ea,
+                        record.test_standard,
+                        record.test_analytes,
+                        record.pp_notes,
+                        record.source_link or '',
+                        record.label_and_symbol
+                    ])
+
     def process_file(self, file_path: str, output_path: Optional[str] = None) -> DocumentExtraction:
         """处理DOCX文件并提取结构化信息。
 
@@ -232,15 +286,20 @@ def parse_args() -> argparse.Namespace:
         包含解析后参数的Namespace对象。
     """
     parser = argparse.ArgumentParser(
-        description="从DOCX文档中提取结构化信息",
+        description="从DOCX文档中提取结构化信息，支持单文件或文件夹批量处理",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 处理单个文件
   %(prog)s document.docx
   %(prog)s document.docx -o output.json
+
+  # 处理文件夹中的所有DOCX文件，导出为CSV
+  %(prog)s ./documents -o results.csv
+
+  # 使用自定义API配置
   %(prog)s document.docx --api-key your-api-key --model gpt-4o
   %(prog)s document.docx --api-base https://api.openai.com/v1
-  %(prog)s document.docx -o output.json --json
 
 环境变量:
   OPENAI_API_KEY     OpenAI API密钥（如果未通过 --api-key 指定）
@@ -250,16 +309,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "input_file",
+        "input_path",
         type=str,
-        help="输入的DOCX文件路径"
+        help="输入的DOCX文件路径或包含DOCX文件的文件夹路径"
     )
 
     parser.add_argument(
         "-o", "--output",
         type=str,
         default=None,
-        help="输出JSON文件路径（可选）"
+        help="输出文件路径（.json 或 .csv 格式）。处理文件夹时建议使用 .csv 格式"
     )
 
     parser.add_argument(
@@ -296,7 +355,7 @@ def main():
     """CLI工具主入口函数。
 
     解析命令行参数，验证输入，并处理DOCX文件以提取结构化信息。
-    结果会打印到标准输出，并可选地保存到JSON文件。
+    支持单文件处理和文件夹批量处理。结果会打印到标准输出，并可选地保存到JSON或CSV文件。
 
     Returns:
         int: 退出代码（0表示成功，1表示失败）。
@@ -316,29 +375,99 @@ def main():
         print("     示例: export OPENAI_API_KEY='your-api-key-here'", file=sys.stderr)
         return 1
 
-    # 验证输入文件
-    input_path = Path(args.input_file)
+    # 验证输入路径
+    input_path = Path(args.input_path)
     if not input_path.exists():
-        print(f"错误: 文件不存在 - {args.input_file}", file=sys.stderr)
+        print(f"错误: 路径不存在 - {args.input_path}", file=sys.stderr)
         return 1
 
-    if input_path.suffix.lower() not in ['.docx', '.doc']:
-        print(f"警告: 文件可能不是DOCX格式 - {args.input_file}", file=sys.stderr)
+    # 创建提取器实例
+    extractor = DocxExtractor(
+        api_key=api_key,
+        model=model,
+        api_base=api_base
+    )
 
-    # 处理文件
     try:
-        extractor = DocxExtractor(
-            api_key=api_key,
-            model=model,
-            api_base=api_base
-        )
-        extraction = extractor.process_file(args.input_file, args.output)
+        # 判断是文件还是文件夹
+        if input_path.is_file():
+            # 处理单个文件
+            if input_path.suffix.lower() not in ['.docx', '.doc']:
+                print(f"警告: 文件可能不是DOCX格式 - {args.input_path}", file=sys.stderr)
 
-        # 如果指定了 --json 标志，输出JSON格式
-        if args.json:
-            print("\n" + "=" * 80)
-            print("JSON输出:")
-            print(json.dumps(extraction.model_dump(), ensure_ascii=False, indent=2))
+            extraction = extractor.process_file(str(input_path), args.output)
+
+            # 如果指定了 --json 标志，输出JSON格式
+            if args.json:
+                print("\n" + "=" * 80)
+                print("JSON输出:")
+                print(json.dumps(extraction.model_dump(), ensure_ascii=False, indent=2))
+
+        elif input_path.is_dir():
+            # 处理文件夹中的所有DOCX文件
+            docx_files = list(input_path.glob("*.docx")) + list(input_path.glob("*.doc"))
+
+            if not docx_files:
+                print(f"错误: 文件夹中没有找到DOCX文件 - {args.input_path}", file=sys.stderr)
+                return 1
+
+            print(f"找到 {len(docx_files)} 个DOCX文件")
+            print("=" * 80)
+
+            extractions = []
+            for idx, docx_file in enumerate(docx_files, 1):
+                print(f"\n[{idx}/{len(docx_files)}] 处理文件: {docx_file.name}")
+                print("-" * 80)
+
+                try:
+                    extraction = extractor.process_file(str(docx_file))
+                    extractions.append((docx_file.name, extraction))
+                except Exception as e:
+                    print(f"警告: 处理文件 {docx_file.name} 时出错: {e}", file=sys.stderr)
+                    continue
+
+            # 保存结果
+            if args.output:
+                output_path = Path(args.output)
+                if output_path.suffix.lower() == '.csv':
+                    # 导出为CSV
+                    DocxExtractor.export_to_csv(extractions, str(output_path))
+                    print(f"\n所有结果已保存到CSV文件: {output_path}")
+                elif output_path.suffix.lower() == '.json':
+                    # 导出为JSON
+                    all_data = {
+                        "files": [
+                            {
+                                "filename": filename,
+                                "records": extraction.model_dump()["records"]
+                            }
+                            for filename, extraction in extractions
+                        ]
+                    }
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        json.dump(all_data, f, ensure_ascii=False, indent=2)
+                    print(f"\n所有结果已保存到JSON文件: {output_path}")
+                else:
+                    print(f"警告: 不支持的输出格式 {output_path.suffix}，请使用 .csv 或 .json", file=sys.stderr)
+
+            # 如果指定了 --json 标志，输出JSON格式到标准输出
+            if args.json:
+                all_data = {
+                    "files": [
+                        {
+                            "filename": filename,
+                            "records": extraction.model_dump()["records"]
+                        }
+                        for filename, extraction in extractions
+                    ]
+                }
+                print("\n" + "=" * 80)
+                print("JSON输出:")
+                print(json.dumps(all_data, ensure_ascii=False, indent=2))
+
+        else:
+            print(f"错误: 输入路径既不是文件也不是文件夹 - {args.input_path}", file=sys.stderr)
+            return 1
 
         return 0
 
