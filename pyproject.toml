@@ -1,0 +1,14 @@
+[project]
+name = "handwriting"
+version = "0.1.0"
+description = "DOCX文档信息提取工具，使用OpenAI结构化输出提取文档中的特定字段"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=2.7.1",
+    "python-docx>=1.2.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+docx-extract = "main:main"
