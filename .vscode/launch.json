@@ -12,9 +12,14 @@
             "console": "integratedTerminal",
             "envFile": "${workspaceFolder}/.env",
             "args": [
-                "data/HK_SG_MY-SZ-099-1701  General Toys (HongKong, Singapore, Malaysia).docx",
+                "data",
                 "-o",
-                "output.json"
+                "output.csv",
+                "--batch-mode",
+                "--batch-size",
+                "20",
+                "--max-concurrent",
+                "5"
             ]
         }
     ]

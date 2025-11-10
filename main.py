@@ -47,6 +47,7 @@ Note:
 """
 
 import argparse
+import asyncio
 import csv
 import json
 import os
@@ -55,8 +56,9 @@ from pathlib import Path
 from typing import Optional
 
 from docx import Document
-from openai import AzureOpenAI, OpenAI
+from openai import AzureOpenAI, OpenAI, AsyncAzureOpenAI, AsyncOpenAI
 from pydantic import BaseModel, Field
+from tqdm import tqdm
 
 
 class DocumentFields(BaseModel):
@@ -104,7 +106,7 @@ class DocxExtractor:
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4o-2024-08-06",
+        model: str = "gpt-5-chat",
         api_base: Optional[str] = None,
         use_azure: bool = False,
         azure_endpoint: Optional[str] = None,
@@ -135,12 +137,20 @@ class DocxExtractor:
                 azure_endpoint=azure_endpoint,
                 api_version=azure_api_version
             )
+            # Create async client for batch processing
+            self.async_client = AsyncAzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=azure_api_version
+            )
         else:
             client_kwargs = {"api_key": api_key}
             if api_base:
                 client_kwargs["base_url"] = api_base
 
             self.client = OpenAI(**client_kwargs)
+            # Create async client for batch processing
+            self.async_client = AsyncOpenAI(**client_kwargs)
 
         self.model = model
         self.use_azure = use_azure
@@ -149,7 +159,8 @@ class DocxExtractor:
         """Reads a DOCX file and extracts all text content.
 
         This method extracts paragraph text and table content from the document,
-        combining them into a single string.
+        combining them into a single string. It also detects and marks cells
+        that contain images.
 
         Args:
             file_path: Path to the DOCX file (relative or absolute).
@@ -167,11 +178,21 @@ class DocxExtractor:
         # Extract all paragraph text
         paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
 
-        # Extract table content
+        # Extract table content with image detection
         tables_content = []
         for table in doc.tables:
             for row in table.rows:
-                row_data = [cell.text.strip() for cell in row.cells]
+                row_data = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    # Check if cell contains images
+                    if self._cell_has_images(cell):
+                        # Append image marker to cell content
+                        if cell_text:
+                            cell_text += " [IMAGE: Contains label/symbol image]"
+                        else:
+                            cell_text = "[IMAGE: Contains label/symbol image]"
+                    row_data.append(cell_text)
                 if any(row_data):  # Only add non-empty rows
                     tables_content.append(" | ".join(row_data))
 
@@ -182,11 +203,184 @@ class DocxExtractor:
 
         return full_text
 
+    def _cell_has_images(self, cell) -> bool:
+        """Check if a table cell contains any images.
+
+        Args:
+            cell: A docx table cell object.
+
+        Returns:
+            True if the cell contains one or more images, False otherwise.
+        """
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                # Check if the run contains any drawing elements (images)
+                if run._element.xpath('.//w:drawing'):
+                    return True
+                # Also check for inline shapes (another way images can be embedded)
+                if run._element.xpath('.//w:pict'):
+                    return True
+        return False
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """Estimates the number of tokens in a text string.
+
+        This uses a simple heuristic:
+        - For ASCII characters: ~4 characters per token
+        - For non-ASCII (including Chinese): ~2 characters per token
+
+        Args:
+            text: The text to estimate tokens for.
+
+        Returns:
+            Estimated number of tokens.
+        """
+        if not text:
+            return 0
+
+        ascii_chars = sum(1 for c in text if ord(c) < 128)
+        non_ascii_chars = len(text) - ascii_chars
+
+        # Rough estimation: 4 chars/token for ASCII, 2 chars/token for non-ASCII
+        estimated_tokens = (ascii_chars / 4.0) + (non_ascii_chars / 2.0)
+
+        return int(estimated_tokens) + 1  # Add 1 for safety margin
+
+    def read_docx_in_batches(
+        self,
+        file_path: str,
+        batch_size: int = 10,
+        max_tokens_per_batch: int = 20000
+    ) -> list[str]:
+        """Reads a DOCX file and splits table content into batches by rows with dynamic token window.
+
+        This method extracts table content and splits it into multiple batches.
+        It uses a dynamic window strategy that considers both row count and token limits
+        to ensure the output doesn't get truncated due to exceeding token limits.
+
+        Args:
+            file_path: Path to the DOCX file (relative or absolute).
+            batch_size: Maximum number of data rows per batch. Defaults to 10.
+                This serves as an upper limit; actual batch size may be smaller
+                if token limit is reached.
+            max_tokens_per_batch: Maximum tokens per batch input. Defaults to 20000.
+                This ensures enough room for model output (typically ~4-8k tokens).
+
+        Returns:
+            A list of strings, each containing a batch of table content with header.
+
+        Raises:
+            FileNotFoundError: If the specified file does not exist.
+            docx.opc.exceptions.PackageNotFoundError: If the file is not a valid DOCX format.
+        """
+        doc = Document(file_path)
+        batches = []
+
+        # Extract paragraph text (will be prepended to each batch)
+        paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
+        paragraph_text = "\n".join(paragraphs) if paragraphs else ""
+
+        # Reserve tokens for system prompt (~2000), paragraph text, and formatting
+        system_prompt_tokens = 2000
+        paragraph_tokens = self.estimate_tokens(paragraph_text)
+        reserved_tokens = system_prompt_tokens + paragraph_tokens + 500  # 500 for formatting
+
+        # Process each table
+        for table_idx, table in enumerate(doc.tables):
+            if len(table.rows) == 0:
+                continue
+
+            # Extract header row with image detection
+            header_row = table.rows[0]
+            header_data = []
+            for cell in header_row.cells:
+                cell_text = cell.text.strip()
+                if self._cell_has_images(cell):
+                    if cell_text:
+                        cell_text += " [IMAGE: Contains label/symbol image]"
+                    else:
+                        cell_text = "[IMAGE: Contains label/symbol image]"
+                header_data.append(cell_text)
+
+            header_line = " | ".join(header_data)
+            header_tokens = self.estimate_tokens(header_line)
+
+            # Extract data rows with image detection
+            data_rows = []
+            data_row_tokens = []
+            for row in table.rows[1:]:  # Skip header
+                row_data = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    if self._cell_has_images(cell):
+                        if cell_text:
+                            cell_text += " [IMAGE: Contains label/symbol image]"
+                        else:
+                            cell_text = "[IMAGE: Contains label/symbol image]"
+                    row_data.append(cell_text)
+                if any(row_data):  # Only add non-empty rows
+                    row_line = " | ".join(row_data)
+                    data_rows.append(row_line)
+                    data_row_tokens.append(self.estimate_tokens(row_line))
+
+            # Dynamic batching based on token count
+            batch_idx = 0
+            i = 0
+            while i < len(data_rows):
+                batch_data_rows = []
+                current_batch_tokens = reserved_tokens + header_tokens
+
+                # Add rows until we hit batch_size or token limit
+                rows_in_batch = 0
+                while i < len(data_rows) and rows_in_batch < batch_size:
+                    row_tokens = data_row_tokens[i]
+
+                    # Check if adding this row would exceed token limit
+                    if current_batch_tokens + row_tokens > max_tokens_per_batch:
+                        # If this is the first row in batch, we must include it anyway
+                        if rows_in_batch == 0:
+                            batch_data_rows.append(data_rows[i])
+                            i += 1
+                            print(f"Warning: Single row exceeds token limit ({row_tokens} tokens)")
+                        break
+
+                    batch_data_rows.append(data_rows[i])
+                    current_batch_tokens += row_tokens
+                    rows_in_batch += 1
+                    i += 1
+
+                # Construct batch content
+                if batch_data_rows:
+                    batch_content = []
+                    if paragraph_text:
+                        batch_content.append(paragraph_text)
+
+                    batch_content.append(f"\n=== Table {table_idx + 1} (Batch {batch_idx + 1}) ===")
+                    batch_content.append(header_line)
+                    batch_content.extend(batch_data_rows)
+
+                    batch_text = "\n".join(batch_content)
+                    batches.append(batch_text)
+
+                    # Log batch info
+                    actual_tokens = self.estimate_tokens(batch_text)
+                    print(f"  Batch {batch_idx + 1}: {rows_in_batch} rows, ~{actual_tokens} tokens")
+
+                    batch_idx += 1
+
+        # If no tables found, return the whole document as one batch
+        if not batches:
+            batches.append(self.read_docx(file_path))
+
+        return batches
+
     def convert_tables_to_markdown(self, file_path: str) -> str:
         """Converts all tables in a DOCX file to Markdown format.
 
         This method extracts all tables from the document and converts them
         to Markdown table syntax. Non-table content is preserved as plain text.
+        It also detects and marks cells that contain images.
 
         Args:
             file_path: Path to the DOCX file (relative or absolute).
@@ -212,10 +406,20 @@ class DocxExtractor:
             output.append(f"### Table {table_idx}")
             output.append("")
 
-            # Get table data
+            # Get table data with image detection
             table_data = []
             for row in table.rows:
-                row_data = [cell.text.strip() for cell in row.cells]
+                row_data = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    # Check if cell contains images
+                    if self._cell_has_images(cell):
+                        # Append image marker to cell content
+                        if cell_text:
+                            cell_text += " [IMAGE: Contains label/symbol image]"
+                        else:
+                            cell_text = "[IMAGE: Contains label/symbol image]"
+                    row_data.append(cell_text)
                 table_data.append(row_data)
 
             if not table_data:
@@ -267,17 +471,38 @@ class DocxExtractor:
                     "role": "system",
                     "content": """You are a professional document information extraction assistant. Please extract the following fields from the provided document content:
                     1. TL EA: Extract the attached protocol information from Column 1
+                       - Extract ALL content completely and accurately from Column 1
+                       - Do not omit, summarize, or truncate any text
                     2. Test standard: Extract non-website content from Column 2 (test standard)
-                    3. Test analytes: Extract test analyte information from Column 5
+                       - Extract ALL text content from Column 2 completely
+                       - Exclude only website URLs (which should go to Source link field)
+                       - Do not omit, summarize, or truncate any text
+                    3. Test analytes: Extract test analyte information ONLY from Column 5
+                       - IMPORTANT: Only extract content that appears in Column 5
+                       - Do NOT extract test analytes or chemical names from Column 3 (PP notes) or any other columns
+                       - If Column 5 is empty, return an empty string
+                       - Only use the exact content from Column 5, do not infer or analyze from other columns
+                       - Extract ALL content from Column 5 completely when present
                     4. PP notes: Extract notes information from Column 3
+                       - CRITICAL: Extract ALL content from Column 3 completely and accurately
+                       - Do NOT omit any text even if it contains chemical names or test information
+                       - Do NOT summarize or truncate the content
+                       - Column 3 often contains detailed requirements, standards, and notes - preserve everything
                     5. Source link: If there is a website link in Column 2, extract it; otherwise return null
-                    6. Label and symbol: Check if there are any labels in this row, return "yes" if found, otherwise return "no"
+                    6. Label and symbol: This field indicates whether this row contains any label or symbol images (such as certification marks, safety labels, warning symbols, etc.).
+                       - In the document, cells containing images will be marked with "[IMAGE: Contains label/symbol image]"
+                       - If you see this marker in any cell of the current row, return "yes"
+                       - If no such marker is found in the row, return "no"
+                       - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
 
                     Important notes:
                     - The document may contain multiple rows of data (e.g., multiple rows in a table)
                     - Please create a separate record for each row of data
                     - Put all records in the records list
-                    - Please carefully analyze the document content and accurately extract this information."""
+                    - Please carefully analyze the document content and accurately extract this information
+                    - Pay special attention to the "[IMAGE: Contains label/symbol image]" markers to determine the Label and symbol field
+                    - CRITICAL: Test analytes must ONLY come from Column 5, never from other columns
+                    - CRITICAL: All other columns (1, 2, 3) must be extracted COMPLETELY without omission, summarization, or truncation"""
                 },
                 {
                     "role": "user",
@@ -288,6 +513,120 @@ class DocxExtractor:
         )
 
         return completion.output_parsed
+
+    async def extract_fields_async(self, text: str) -> DocumentExtraction:
+        """Asynchronously extracts document fields using OpenAI structured output API.
+
+        This is the async version of extract_fields, used for batch processing.
+
+        Args:
+            text: Text content extracted from the DOCX document.
+
+        Returns:
+            A DocumentExtraction instance containing all extracted records.
+
+        Raises:
+            openai.APIError: If the API call fails.
+            openai.RateLimitError: If the API rate limit is exceeded.
+        """
+        completion = await self.async_client.responses.parse(
+            model=self.model,
+            input=[
+                {
+                    "role": "system",
+                    "content": """You are a professional document information extraction assistant. Please extract the following fields from the provided document content:
+                    1. TL EA: Extract the attached protocol information from Column 1
+                       - Extract ALL content completely and accurately from Column 1
+                       - Do not omit, summarize, or truncate any text
+                    2. Test standard: Extract non-website content from Column 2 (test standard)
+                       - Extract ALL text content from Column 2 completely
+                       - Exclude only website URLs (which should go to Source link field)
+                       - Do not omit, summarize, or truncate any text
+                    3. Test analytes: Extract test analyte information ONLY from Column 5
+                       - IMPORTANT: Only extract content that appears in Column 5
+                       - Do NOT extract test analytes or chemical names from Column 3 (PP notes) or any other columns
+                       - If Column 5 is empty, return an empty string
+                       - Only use the exact content from Column 5, do not infer or analyze from other columns
+                       - Extract ALL content from Column 5 completely when present
+                    4. PP notes: Extract notes information from Column 3
+                       - CRITICAL: Extract ALL content from Column 3 completely and accurately
+                       - Do NOT omit any text even if it contains chemical names or test information
+                       - Do NOT summarize or truncate the content
+                       - Column 3 often contains detailed requirements, standards, and notes - preserve everything
+                    5. Source link: If there is a website link in Column 2, extract it; otherwise return null
+                    6. Label and symbol: This field indicates whether this row contains any label or symbol images (such as certification marks, safety labels, warning symbols, etc.).
+                       - In the document, cells containing images will be marked with "[IMAGE: Contains label/symbol image]"
+                       - If you see this marker in any cell of the current row, return "yes"
+                       - If no such marker is found in the row, return "no"
+                       - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
+
+                    Important notes:
+                    - The document may contain multiple rows of data (e.g., multiple rows in a table)
+                    - Please create a separate record for each row of data
+                    - Put all records in the records list
+                    - Please carefully analyze the document content and accurately extract this information
+                    - Pay special attention to the "[IMAGE: Contains label/symbol image]" markers to determine the Label and symbol field
+                    - CRITICAL: Test analytes must ONLY come from Column 5, never from other columns
+                    - CRITICAL: All other columns (1, 2, 3) must be extracted COMPLETELY without omission, summarization, or truncation"""
+                },
+                {
+                    "role": "user",
+                    "content": f"Please extract information from all rows in the following document content:\n\n{text}"
+                }
+            ],
+            text_format=DocumentExtraction,
+        )
+
+        return completion.output_parsed
+
+    async def process_batches_async(
+        self,
+        batches: list[str],
+        max_concurrent: int = 5
+    ) -> DocumentExtraction:
+        """Processes multiple batches of document content asynchronously with concurrency control.
+
+        This method processes multiple batches concurrently using asyncio, with a limit
+        on the number of concurrent requests to avoid overwhelming the API.
+
+        Args:
+            batches: List of text batches to process.
+            max_concurrent: Maximum number of concurrent API calls. Defaults to 5.
+
+        Returns:
+            A DocumentExtraction instance containing all records from all batches,
+            maintaining the order of batches.
+
+        Raises:
+            openai.APIError: If any API call fails.
+        """
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def process_with_semaphore(batch_text: str, batch_idx: int) -> tuple[int, DocumentExtraction]:
+            async with semaphore:
+                result = await self.extract_fields_async(batch_text)
+                return batch_idx, result
+
+        # Create tasks for all batches with progress tracking
+        tasks = [process_with_semaphore(batch, idx) for idx, batch in enumerate(batches)]
+
+        # Execute all tasks with progress bar
+        all_records = []
+        with tqdm(total=len(batches), desc="Processing batches", unit="batch") as pbar:
+            for coro in asyncio.as_completed(tasks):
+                batch_idx, extraction = await coro
+                all_records.append((batch_idx, extraction))
+                pbar.update(1)
+
+        # Sort by batch index to maintain order
+        all_records.sort(key=lambda x: x[0])
+
+        # Combine all records from all batches
+        combined_records = []
+        for _, extraction in all_records:
+            combined_records.extend(extraction.records)
+
+        return DocumentExtraction(records=combined_records)
 
     @staticmethod
     def export_to_csv(extractions: list[tuple[str, DocumentExtraction]], output_path: str) -> None:
@@ -381,6 +720,80 @@ class DocxExtractor:
 
         return extraction
 
+    def process_file_with_batches(
+        self,
+        file_path: str,
+        batch_size: int = 10,
+        max_concurrent: int = 5,
+        max_tokens_per_batch: int = 20000,
+        output_path: Optional[str] = None
+    ) -> DocumentExtraction:
+        """Processes a DOCX file using batch processing with async API calls.
+
+        This method splits the document into batches by table rows, then processes
+        all batches concurrently using async API calls. Progress is shown via a
+        progress bar. Uses dynamic token windowing to prevent output truncation.
+
+        Args:
+            file_path: Input DOCX file path (relative or absolute).
+            batch_size: Maximum number of table rows per batch. Defaults to 10.
+                Actual batch size may be smaller if token limit is reached.
+            max_concurrent: Maximum number of concurrent API calls. Defaults to 5.
+            max_tokens_per_batch: Maximum input tokens per batch. Defaults to 20000.
+                This ensures enough room for model output without truncation.
+            output_path: Optional output file path (.json or .csv). If provided, results
+                will be saved in the specified format based on file extension.
+
+        Returns:
+            A DocumentExtraction instance containing all extracted records from all batches.
+
+        Raises:
+            FileNotFoundError: If the input file does not exist.
+            openai.APIError: If the OpenAI API call fails.
+            IOError: If unable to write to the output file.
+        """
+        print(f"Reading file: {file_path}")
+        batches = self.read_docx_in_batches(file_path, batch_size, max_tokens_per_batch)
+
+        print(f"Document split into {len(batches)} batch(es)")
+        print(f"Processing with up to {max_concurrent} concurrent API calls...\n")
+
+        # Run async processing
+        extraction = asyncio.run(self.process_batches_async(batches, max_concurrent))
+
+        print("\n\nExtraction complete!")
+        print("=" * 80)
+        print(f"Total records extracted: {len(extraction.records)}\n")
+
+        for idx, record in enumerate(extraction.records, 1):
+            print(f"Record #{idx}")
+            print("-" * 80)
+            print(f"  TL EA:           {record.tl_ea}")
+            print(f"  Test standard:   {record.test_standard}")
+            print(f"  Test analytes:   {record.test_analytes}")
+            print(f"  PP notes:        {record.pp_notes}")
+            print(f"  Source link:     {record.source_link}")
+            print(f"  Label & symbol:  {record.label_and_symbol}")
+            print()
+
+        print("=" * 80)
+
+        # Save based on file extension
+        if output_path:
+            output_path_obj = Path(output_path)
+            if output_path_obj.suffix.lower() == '.csv':
+                # Export to CSV - use filename from file_path
+                filename = Path(file_path).name
+                DocxExtractor.export_to_csv([(filename, extraction)], output_path)
+                print(f"\nResults saved to CSV: {output_path}")
+            else:
+                # Default to JSON
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(extraction.model_dump(), f, ensure_ascii=False, indent=2)
+                print(f"\nResults saved to JSON: {output_path}")
+
+        return extraction
+
 
 def parse_args() -> argparse.Namespace:
     """Parses command line arguments.
@@ -400,6 +813,10 @@ Examples:
   # Process all DOCX files in a folder and export to CSV
   %(prog)s ./documents -o results.csv
 
+  # Use batch mode for concurrent processing with progress bar
+  %(prog)s document.docx --batch-mode --batch-size 10 --max-concurrent 5
+  %(prog)s ./documents --batch-mode -o results.csv
+
   # Convert DOCX tables to Markdown (no AI processing)
   %(prog)s document.docx --to-markdown
   %(prog)s document.docx --to-markdown -o output.md
@@ -407,6 +824,13 @@ Examples:
   # Use custom API configuration
   %(prog)s document.docx --api-key your-api-key --model gpt-4o
   %(prog)s document.docx --api-base https://api.openai.com/v1
+
+Batch Mode:
+  When --batch-mode is enabled, the tool splits tables by rows and processes
+  them concurrently with async API calls. This is useful for large documents
+  with many table rows, as it can significantly speed up processing while
+  maintaining consistent table headers across all batches. Progress is shown
+  via a progress bar.
 
 Environment variables (Azure OpenAI - enabled by default):
   USE_AZURE_OPENAI           Whether to use Azure OpenAI (default: true)
@@ -466,6 +890,33 @@ Environment variables (Standard OpenAI - when USE_AZURE_OPENAI=false):
         "--to-markdown",
         action="store_true",
         help="Convert DOCX tables to Markdown format (no AI processing)"
+    )
+
+    parser.add_argument(
+        "--batch-mode",
+        action="store_true",
+        help="Enable batch processing mode: split tables by rows and process concurrently"
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Number of table rows per batch (default: 10)"
+    )
+
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent API calls (default: 5)"
+    )
+
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=20000,
+        help="Maximum input tokens per batch (default: 20000). Prevents output truncation by limiting input size."
     )
 
     return parser.parse_args()
@@ -598,7 +1049,17 @@ def main():
             if input_path.suffix.lower() not in ['.docx', '.doc']:
                 print(f"Warning: File may not be in DOCX format - {args.input_path}", file=sys.stderr)
 
-            extraction = extractor.process_file(str(input_path), args.output)
+            # Choose processing method based on batch mode flag
+            if args.batch_mode:
+                extraction = extractor.process_file_with_batches(
+                    str(input_path),
+                    batch_size=args.batch_size,
+                    max_concurrent=args.max_concurrent,
+                    max_tokens_per_batch=args.max_tokens,
+                    output_path=args.output
+                )
+            else:
+                extraction = extractor.process_file(str(input_path), args.output)
 
             # Output JSON format if --json flag is specified
             if args.json:
@@ -615,6 +1076,8 @@ def main():
                 return 1
 
             print(f"Found {len(docx_files)} DOCX file(s)")
+            if args.batch_mode:
+                print(f"Batch mode enabled: {args.batch_size} rows per batch, {args.max_concurrent} max concurrent")
             print("=" * 80)
 
             extractions = []
@@ -623,7 +1086,15 @@ def main():
                 print("-" * 80)
 
                 try:
-                    extraction = extractor.process_file(str(docx_file))
+                    if args.batch_mode:
+                        extraction = extractor.process_file_with_batches(
+                            str(docx_file),
+                            batch_size=args.batch_size,
+                            max_concurrent=args.max_concurrent,
+                            max_tokens_per_batch=args.max_tokens
+                        )
+                    else:
+                        extraction = extractor.process_file(str(docx_file))
                     extractions.append((docx_file.name, extraction))
                 except Exception as e:
                     print(f"Warning: Error processing file {docx_file.name}: {e}", file=sys.stderr)
