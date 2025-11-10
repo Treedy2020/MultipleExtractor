@@ -8,9 +8,29 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+env/
 
-#
+# Environment variables
 .env
+.env.local
 
-#
-**.DS_Store
+# macOS
+.DS_Store
+*.DS_Store
+
+# Output files
+output.json
+output.csv
+test_output.*
+*.docx
+!sample.docx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# uv
+.uv/
