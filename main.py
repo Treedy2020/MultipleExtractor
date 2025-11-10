@@ -1,35 +1,49 @@
-"""DOCX文档信息提取工具。
+"""DOCX document information extraction tool.
 
-使用OpenAI结构化输出提取文档中的特定字段。支持从单个文档中提取多条记录（例如表格的多行数据），
-以及批量处理文件夹中的多个文档。
+This module extracts structured information from DOCX documents using OpenAI or
+Azure OpenAI structured outputs. It supports extracting multiple records from a
+single document (e.g., multiple rows in a table) and batch processing multiple
+documents in a folder.
 
 Features:
-    - 单文件处理：提取单个DOCX文档中的结构化信息
-    - 批量处理：处理文件夹中的所有DOCX文件
-    - 多格式导出：支持JSON和CSV格式输出
-    - 多记录提取：自动识别文档中的多行数据
+    - Single file processing: Extract structured information from a single DOCX
+    - Batch processing: Process all DOCX files in a folder
+    - Multi-format export: Support JSON and CSV format outputs
+    - Multi-record extraction: Automatically identify multiple rows of data
+    - Dual API support: Support both Azure OpenAI and standard OpenAI API
 
-Typical usage example:
-    # 处理单个文件
+Typical usage examples:
+    # Use Azure OpenAI (default)
     python main.py document.docx
     python main.py document.docx -o output.json
 
-    # 批量处理文件夹，导出为CSV
+    # Batch process folder and export to CSV
     python main.py ./documents -o results.csv
 
-    # 使用自定义API配置
-    python main.py document.docx --api-key your-api-key --model gpt-4o
-    python main.py document.docx --api-base https://api.openai.com/v1
+    # Use custom Azure configuration
+    python main.py document.docx --api-key your-azure-key --model your-deployment-name
 
-Environment variables:
-    OPENAI_API_KEY: OpenAI API密钥
-    OPENAI_API_BASE: OpenAI API基础URL
-    OPENAI_MODEL: 使用的模型名称（默认: gpt-4o-2024-08-06）
+    # Use standard OpenAI API
+    set USE_AZURE_OPENAI=false
+    python main.py document.docx --api-key your-openai-key
+
+Environment variables (Azure OpenAI - enabled by default):
+    USE_AZURE_OPENAI: Whether to use Azure OpenAI (default: true)
+    AZURE_OPENAI_API_KEY: Azure OpenAI API key
+    AZURE_OPENAI_ENDPOINT: Azure OpenAI endpoint URL
+    AZURE_OPENAI_API_VERSION: Azure OpenAI API version (default: 2024-08-01-preview)
+    AZURE_OPENAI_DEPLOYMENT: Azure OpenAI deployment name (default: gpt-4o)
+
+Environment variables (Standard OpenAI - when USE_AZURE_OPENAI=false):
+    OPENAI_API_KEY: OpenAI API key
+    OPENAI_API_BASE: OpenAI API base URL
+    OPENAI_MODEL: Model name to use (default: gpt-4o-2024-08-06)
 
 Note:
-    - 文档中的每一行数据都会被提取为一个单独的记录，所有记录会以列表形式返回
-    - 批量处理文件夹时，建议使用CSV格式以便整合所有文件的结果
-    - CSV输出会包含源文件名，方便追踪每条记录的来源
+    - Each row of data in the document will be extracted as a separate record
+    - When batch processing folders, CSV format is recommended for consolidation
+    - CSV output includes source filename for tracking record origins
+    - Azure OpenAI is used by default, set USE_AZURE_OPENAI=false to switch to standard OpenAI
 """
 
 import argparse
@@ -41,147 +55,233 @@ from pathlib import Path
 from typing import Optional
 
 from docx import Document
-from openai import OpenAI
+from openai import AzureOpenAI, OpenAI
 from pydantic import BaseModel, Field
 
 
 class DocumentFields(BaseModel):
-    """文档字段结构化模型。
+    """Structured model for document fields.
 
     Attributes:
-        tl_ea: Column 1中的attached protocol - TL EA信息。
-        test_standard: Column 2中的测试标准（非网站链接）。
-        test_analytes: Column 5中的测试分析物。
-        pp_notes: Column 3中的PP备注信息。
-        source_link: Column 2中的网站链接（如果有）。
-        label_and_symbol: 是否找到标签和符号（yes/no）。
+        tl_ea: TL EA information from Column 1 of attached protocol.
+        test_standard: Test standard from Column 2 (excluding website links).
+        test_analytes: Test analytes from Column 5.
+        pp_notes: PP notes information from Column 3.
+        source_link: Website link from Column 2 if found, otherwise None.
+        label_and_symbol: Whether any label is found in this row (yes/no).
     """
-    tl_ea: str = Field(description="Column 1 of attached protocol - TL EA信息")
-    test_standard: str = Field(description="Column 2 but not website - 测试标准（非网站链接）")
-    test_analytes: str = Field(description="Column 5 - 测试分析物")
-    pp_notes: str = Field(description="Column 3 - PP备注信息")
-    source_link: Optional[str] = Field(default=None, description="Column 2 website if found - 来源链接（如果有网站）")
-    label_and_symbol: str = Field(description="Any label found in this row, just state yes/no - 是否找到标签和符号")
+    tl_ea: str = Field(description="Column 1 of attached protocol - TL EA information")
+    test_standard: str = Field(description="Column 2 but not website - test standard (excluding website links)")
+    test_analytes: str = Field(description="Column 5 - test analytes")
+    pp_notes: str = Field(description="Column 3 - PP notes information")
+    source_link: Optional[str] = Field(default=None, description="Column 2 website if found - source link")
+    label_and_symbol: str = Field(description="Any label found in this row, just state yes/no")
 
 
 class DocumentExtraction(BaseModel):
-    """文档提取结果模型，包含多个记录。
+    """Document extraction result model containing multiple records.
 
     Attributes:
-        records: 从文档中提取的所有记录列表。
+        records: List of all records extracted from the document.
     """
     records: list[DocumentFields] = Field(
-        description="文档中提取的所有记录，每个记录对应文档中的一行数据"
+        description="All records extracted from the document, each record corresponds to a row of data"
     )
 
 
 class DocxExtractor:
-    """DOCX文档提取器，用于从Word文档中提取结构化信息。
+    """DOCX document extractor for extracting structured information from Word documents.
 
-    该类使用OpenAI的结构化输出功能，从DOCX文档中提取特定字段。
+    This class uses OpenAI or Azure OpenAI structured output functionality to
+    extract specific fields from DOCX documents.
 
     Attributes:
-        client: OpenAI客户端实例。
-        model: 使用的OpenAI模型名称。
+        client: OpenAI or AzureOpenAI client instance.
+        model: Name of the OpenAI model or Azure deployment to use.
+        use_azure: Whether Azure OpenAI is being used.
     """
 
     def __init__(
         self,
         api_key: str,
         model: str = "gpt-4o-2024-08-06",
-        api_base: Optional[str] = None
+        api_base: Optional[str] = None,
+        use_azure: bool = False,
+        azure_endpoint: Optional[str] = None,
+        azure_api_version: Optional[str] = None
     ):
-        """初始化DocxExtractor实例。
+        """Initializes a DocxExtractor instance.
 
         Args:
-            api_key: OpenAI API密钥。
-            model: 使用的模型名称，默认为 "gpt-4o-2024-08-06"。
-            api_base: API基础URL，默认为None（使用OpenAI官方地址）。
+            api_key: OpenAI or Azure OpenAI API key.
+            model: Model name or Azure deployment name. Defaults to "gpt-4o-2024-08-06".
+            api_base: API base URL. Defaults to None (uses OpenAI official address).
+            use_azure: Whether to use Azure OpenAI. Defaults to False.
+            azure_endpoint: Azure OpenAI endpoint URL (required when use_azure=True).
+            azure_api_version: Azure OpenAI API version (required when use_azure=True).
 
         Raises:
-            openai.OpenAIError: 如果API密钥无效。
+            openai.OpenAIError: If the API key is invalid.
+            ValueError: If using Azure but missing required parameters.
         """
-        client_kwargs = {"api_key": api_key}
-        if api_base:
-            client_kwargs["base_url"] = api_base
+        if use_azure:
+            if not azure_endpoint:
+                raise ValueError("azure_endpoint is required when using Azure OpenAI")
+            if not azure_api_version:
+                raise ValueError("azure_api_version is required when using Azure OpenAI")
 
-        self.client = OpenAI(**client_kwargs)
+            self.client = AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=azure_api_version
+            )
+        else:
+            client_kwargs = {"api_key": api_key}
+            if api_base:
+                client_kwargs["base_url"] = api_base
+
+            self.client = OpenAI(**client_kwargs)
+
         self.model = model
+        self.use_azure = use_azure
 
     def read_docx(self, file_path: str) -> str:
-        """读取docx文件并提取所有文本内容。
+        """Reads a DOCX file and extracts all text content.
 
-        该方法会提取文档中的段落文本和表格内容，并将它们组合成单个字符串。
+        This method extracts paragraph text and table content from the document,
+        combining them into a single string.
 
         Args:
-            file_path: DOCX文件的路径（相对或绝对路径）。
+            file_path: Path to the DOCX file (relative or absolute).
 
         Returns:
-            包含文档所有内容的字符串，段落和表格内容会被分开标注。
+            A string containing all document content, with paragraphs and tables
+            separately annotated.
 
         Raises:
-            FileNotFoundError: 如果指定的文件不存在。
-            docx.opc.exceptions.PackageNotFoundError: 如果文件不是有效的DOCX格式。
+            FileNotFoundError: If the specified file does not exist.
+            docx.opc.exceptions.PackageNotFoundError: If the file is not a valid DOCX format.
         """
         doc = Document(file_path)
-        
-        # 提取所有段落文本
+
+        # Extract all paragraph text
         paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
-        
-        # 提取表格内容
+
+        # Extract table content
         tables_content = []
         for table in doc.tables:
             for row in table.rows:
                 row_data = [cell.text.strip() for cell in row.cells]
-                if any(row_data):  # 只添加非空行
+                if any(row_data):  # Only add non-empty rows
                     tables_content.append(" | ".join(row_data))
-        
-        # 合并所有内容
+
+        # Combine all content
         full_text = "\n".join(paragraphs)
         if tables_content:
-            full_text += "\n\n=== 表格内容 ===\n" + "\n".join(tables_content)
-        
-        return full_text
-    
-    def extract_fields(self, text: str) -> DocumentExtraction:
-        """使用OpenAI结构化输出API提取文档字段。
+            full_text += "\n\n=== Table Content ===\n" + "\n".join(tables_content)
 
-        该方法将文档文本发送到OpenAI API，使用结构化输出功能提取预定义的字段。
-        一个文档可能包含多行数据，每行都会被提取为一个DocumentFields记录。
+        return full_text
+
+    def convert_tables_to_markdown(self, file_path: str) -> str:
+        """Converts all tables in a DOCX file to Markdown format.
+
+        This method extracts all tables from the document and converts them
+        to Markdown table syntax. Non-table content is preserved as plain text.
 
         Args:
-            text: 从DOCX文档中提取的文本内容。
+            file_path: Path to the DOCX file (relative or absolute).
 
         Returns:
-            包含所有提取记录的DocumentExtraction实例。
+            A string containing the document content with tables in Markdown format.
 
         Raises:
-            openai.APIError: 如果API调用失败。
-            openai.RateLimitError: 如果超出API速率限制。
+            FileNotFoundError: If the specified file does not exist.
+            docx.opc.exceptions.PackageNotFoundError: If the file is not a valid DOCX format.
+        """
+        doc = Document(file_path)
+        output = []
+
+        # Extract paragraphs
+        for para in doc.paragraphs:
+            if para.text.strip():
+                output.append(para.text)
+                output.append("")  # Add blank line
+
+        # Extract and convert tables to Markdown
+        for table_idx, table in enumerate(doc.tables, 1):
+            output.append(f"### Table {table_idx}")
+            output.append("")
+
+            # Get table data
+            table_data = []
+            for row in table.rows:
+                row_data = [cell.text.strip() for cell in row.cells]
+                table_data.append(row_data)
+
+            if not table_data:
+                continue
+
+            # Assume first row is header
+            if len(table_data) > 0:
+                header = table_data[0]
+                num_cols = len(header)
+
+                # Write header
+                output.append("| " + " | ".join(header) + " |")
+
+                # Write separator
+                output.append("| " + " | ".join(["---"] * num_cols) + " |")
+
+                # Write data rows
+                for row in table_data[1:]:
+                    # Pad row if it has fewer columns than header
+                    while len(row) < num_cols:
+                        row.append("")
+                    output.append("| " + " | ".join(row[:num_cols]) + " |")
+
+                output.append("")  # Add blank line after table
+
+        return "\n".join(output)
+
+    def extract_fields(self, text: str) -> DocumentExtraction:
+        """Extracts document fields using OpenAI structured output API.
+
+        This method sends document text to the OpenAI API and uses structured
+        output functionality to extract predefined fields. A document may contain
+        multiple rows of data, each extracted as a DocumentFields record.
+
+        Args:
+            text: Text content extracted from the DOCX document.
+
+        Returns:
+            A DocumentExtraction instance containing all extracted records.
+
+        Raises:
+            openai.APIError: If the API call fails.
+            openai.RateLimitError: If the API rate limit is exceeded.
         """
         completion = self.client.responses.parse(
             model=self.model,
             input=[
                 {
                     "role": "system",
-                    "content": """你是一个专业的文档信息提取助手。请从提供的文档内容中提取以下字段：
+                    "content": """You are a professional document information extraction assistant. Please extract the following fields from the provided document content:
+                    1. TL EA: Extract the attached protocol information from Column 1
+                    2. Test standard: Extract non-website content from Column 2 (test standard)
+                    3. Test analytes: Extract test analyte information from Column 5
+                    4. PP notes: Extract notes information from Column 3
+                    5. Source link: If there is a website link in Column 2, extract it; otherwise return null
+                    6. Label and symbol: Check if there are any labels in this row, return "yes" if found, otherwise return "no"
 
-1. TL EA: 提取Column 1中的attached protocol信息
-2. Test standard: 提取Column 2中的非网站内容（测试标准）
-3. Test analytes: 提取Column 5中的测试分析物信息
-4. PP notes: 提取Column 3中的备注信息
-5. Source link: 如果Column 2中有网站链接，提取它；否则返回null
-6. Label and symbol: 检查该行是否有任何标签，如果找到就返回"yes"，否则返回"no"
-
-重要提示：
-- 文档中可能包含多行数据（例如表格的多行）
-- 请为每一行数据创建一个单独的记录
-- 将所有记录放在records列表中返回
-- 请仔细分析文档内容，准确提取这些信息。"""
+                    Important notes:
+                    - The document may contain multiple rows of data (e.g., multiple rows in a table)
+                    - Please create a separate record for each row of data
+                    - Put all records in the records list
+                    - Please carefully analyze the document content and accurately extract this information."""
                 },
                 {
                     "role": "user",
-                    "content": f"请从以下文档内容中提取所有行的信息：\n\n{text}"
+                    "content": f"Please extract information from all rows in the following document content:\n\n{text}"
                 }
             ],
             text_format=DocumentExtraction,
@@ -191,19 +291,19 @@ class DocxExtractor:
 
     @staticmethod
     def export_to_csv(extractions: list[tuple[str, DocumentExtraction]], output_path: str) -> None:
-        """将多个提取结果导出为CSV文件。
+        """Exports multiple extraction results to a CSV file.
 
         Args:
-            extractions: 包含 (文件名, DocumentExtraction) 元组的列表。
-            output_path: CSV输出文件路径。
+            extractions: List of (filename, DocumentExtraction) tuples.
+            output_path: Output CSV file path.
 
         Raises:
-            IOError: 如果无法写入文件。
+            IOError: If unable to write to the file.
         """
         with open(output_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
 
-            # 写入表头
+            # Write header
             writer.writerow([
                 'Source File',
                 'TL EA',
@@ -214,7 +314,7 @@ class DocxExtractor:
                 'Label and Symbol'
             ])
 
-            # 写入每个文件的所有记录
+            # Write all records from each file
             for filename, extraction in extractions:
                 for record in extraction.records:
                     writer.writerow([
@@ -228,37 +328,40 @@ class DocxExtractor:
                     ])
 
     def process_file(self, file_path: str, output_path: Optional[str] = None) -> DocumentExtraction:
-        """处理DOCX文件并提取结构化信息。
+        """Processes a DOCX file and extracts structured information.
 
-        该方法是主要的工作流程方法，它读取DOCX文件、提取字段，并可选地将结果保存到JSON文件。
-        处理进度和结果会打印到标准输出。文档中可能包含多行数据，每行都会被提取。
+        This is the main workflow method that reads the DOCX file, extracts fields,
+        and optionally saves the results to a JSON file. Processing progress and
+        results are printed to standard output. The document may contain multiple
+        rows of data, each of which will be extracted.
 
         Args:
-            file_path: 输入的DOCX文件路径（相对或绝对路径）。
-            output_path: 可选的输出JSON文件路径。如果提供，结果将被保存为JSON格式。
+            file_path: Input DOCX file path (relative or absolute).
+            output_path: Optional output JSON file path. If provided, results will
+                be saved in JSON format.
 
         Returns:
-            包含所有提取记录的DocumentExtraction实例。
+            A DocumentExtraction instance containing all extracted records.
 
         Raises:
-            FileNotFoundError: 如果输入文件不存在。
-            openai.APIError: 如果OpenAI API调用失败。
-            IOError: 如果无法写入输出文件。
+            FileNotFoundError: If the input file does not exist.
+            openai.APIError: If the OpenAI API call fails.
+            IOError: If unable to write to the output file.
         """
-        print(f"正在读取文件: {file_path}")
+        print(f"Reading file: {file_path}")
         text = self.read_docx(file_path)
 
-        print(f"文档内容长度: {len(text)} 字符")
-        print("\n正在使用OpenAI提取结构化信息...")
+        print(f"Document content length: {len(text)} characters")
+        print("\nExtracting structured information using OpenAI...")
 
         extraction = self.extract_fields(text)
 
-        print("\n提取完成！")
+        print("\nExtraction complete!")
         print("=" * 80)
-        print(f"共提取 {len(extraction.records)} 条记录\n")
+        print(f"Total records extracted: {len(extraction.records)}\n")
 
         for idx, record in enumerate(extraction.records, 1):
-            print(f"记录 #{idx}")
+            print(f"Record #{idx}")
             print("-" * 80)
             print(f"  TL EA:           {record.tl_ea}")
             print(f"  Test standard:   {record.test_standard}")
@@ -270,171 +373,271 @@ class DocxExtractor:
 
         print("=" * 80)
 
-        # 如果指定了输出路径，保存为JSON
+        # Save as JSON if output path is specified
         if output_path:
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(extraction.model_dump(), f, ensure_ascii=False, indent=2)
-            print(f"\n结果已保存到: {output_path}")
+            print(f"\nResults saved to: {output_path}")
 
         return extraction
 
 
 def parse_args() -> argparse.Namespace:
-    """解析命令行参数。
+    """Parses command line arguments.
 
     Returns:
-        包含解析后参数的Namespace对象。
+        A Namespace object containing the parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        description="从DOCX文档中提取结构化信息，支持单文件或文件夹批量处理",
+        description="Extract structured information from DOCX documents, supports single file or batch folder processing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 处理单个文件
+Examples:
+  # Process a single file
   %(prog)s document.docx
   %(prog)s document.docx -o output.json
 
-  # 处理文件夹中的所有DOCX文件，导出为CSV
+  # Process all DOCX files in a folder and export to CSV
   %(prog)s ./documents -o results.csv
 
-  # 使用自定义API配置
+  # Convert DOCX tables to Markdown (no AI processing)
+  %(prog)s document.docx --to-markdown
+  %(prog)s document.docx --to-markdown -o output.md
+
+  # Use custom API configuration
   %(prog)s document.docx --api-key your-api-key --model gpt-4o
   %(prog)s document.docx --api-base https://api.openai.com/v1
 
-环境变量:
-  OPENAI_API_KEY     OpenAI API密钥（如果未通过 --api-key 指定）
-  OPENAI_API_BASE    OpenAI API基础URL（如果未通过 --api-base 指定）
-  OPENAI_MODEL       OpenAI模型名称（如果未通过 --model 指定，默认: gpt-4o-2024-08-06）
+Environment variables (Azure OpenAI - enabled by default):
+  USE_AZURE_OPENAI           Whether to use Azure OpenAI (default: true)
+  AZURE_OPENAI_API_KEY       Azure OpenAI API key
+  AZURE_OPENAI_ENDPOINT      Azure OpenAI endpoint URL
+  AZURE_OPENAI_API_VERSION   Azure OpenAI API version (default: 2024-08-01-preview)
+  AZURE_OPENAI_DEPLOYMENT    Azure OpenAI deployment name (default: gpt-4o)
+
+Environment variables (Standard OpenAI - when USE_AZURE_OPENAI=false):
+  OPENAI_API_KEY     OpenAI API key (if not specified via --api-key)
+  OPENAI_API_BASE    OpenAI API base URL (if not specified via --api-base)
+  OPENAI_MODEL       OpenAI model name (if not specified via --model, default: gpt-4o-2024-08-06)
         """
     )
 
     parser.add_argument(
         "input_path",
         type=str,
-        help="输入的DOCX文件路径或包含DOCX文件的文件夹路径"
+        help="Input DOCX file path or folder path containing DOCX files"
     )
 
     parser.add_argument(
         "-o", "--output",
         type=str,
         default=None,
-        help="输出文件路径（.json 或 .csv 格式）。处理文件夹时建议使用 .csv 格式"
+        help="Output file path (.json or .csv format). CSV format is recommended for folder processing"
     )
 
     parser.add_argument(
         "--api-key",
         type=str,
         default=None,
-        help="OpenAI API密钥（优先于环境变量OPENAI_API_KEY）"
+        help="API key (Azure mode: AZURE_OPENAI_API_KEY, OpenAI mode: OPENAI_API_KEY)"
     )
 
     parser.add_argument(
         "--api-base",
         type=str,
         default=None,
-        help="OpenAI API基础URL（优先于环境变量OPENAI_API_BASE）"
+        help="API endpoint URL (Azure mode: AZURE_OPENAI_ENDPOINT, OpenAI mode: OPENAI_API_BASE)"
     )
 
     parser.add_argument(
         "--model",
         type=str,
         default=None,
-        help="使用的模型名称（优先于环境变量OPENAI_MODEL，默认: gpt-4o-2024-08-06）"
+        help="Model/deployment name (Azure mode: AZURE_OPENAI_DEPLOYMENT, OpenAI mode: OPENAI_MODEL)"
     )
 
     parser.add_argument(
         "--json",
         action="store_true",
-        help="以JSON格式输出到标准输出"
+        help="Output in JSON format to standard output"
+    )
+
+    parser.add_argument(
+        "--to-markdown",
+        action="store_true",
+        help="Convert DOCX tables to Markdown format (no AI processing)"
     )
 
     return parser.parse_args()
 
 
 def main():
-    """CLI工具主入口函数。
+    """Main entry point for the CLI tool.
 
-    解析命令行参数，验证输入，并处理DOCX文件以提取结构化信息。
-    支持单文件处理和文件夹批量处理。结果会打印到标准输出，并可选地保存到JSON或CSV文件。
+    Parses command line arguments, validates input, and processes DOCX files to
+    extract structured information. Supports single file processing and batch
+    folder processing. Results are printed to standard output and can optionally
+    be saved to JSON or CSV files.
 
     Returns:
-        int: 退出代码（0表示成功，1表示失败）。
+        Exit code (0 for success, 1 for failure).
     """
     args = parse_args()
 
-    # 获取API配置（优先使用命令行参数，其次是环境变量）
-    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
-    api_base = args.api_base or os.getenv("OPENAI_API_BASE")
-    model = args.model or os.getenv("OPENAI_MODEL") or "gpt-4o-2024-08-06"
-
-    if not api_key:
-        print("错误: 未提供OpenAI API密钥", file=sys.stderr)
-        print("请通过以下方式之一提供API密钥：", file=sys.stderr)
-        print("  1. 使用 --api-key 参数", file=sys.stderr)
-        print("  2. 设置环境变量 OPENAI_API_KEY", file=sys.stderr)
-        print("     示例: export OPENAI_API_KEY='your-api-key-here'", file=sys.stderr)
-        return 1
-
-    # 验证输入路径
+    # Validate input path
     input_path = Path(args.input_path)
     if not input_path.exists():
-        print(f"错误: 路径不存在 - {args.input_path}", file=sys.stderr)
+        print(f"Error: Path does not exist - {args.input_path}", file=sys.stderr)
         return 1
 
-    # 创建提取器实例
-    extractor = DocxExtractor(
-        api_key=api_key,
-        model=model,
-        api_base=api_base
-    )
+    # Handle --to-markdown option (no API required)
+    if args.to_markdown:
+        if not input_path.is_file():
+            print("Error: --to-markdown only supports single file conversion", file=sys.stderr)
+            return 1
+
+        if input_path.suffix.lower() not in ['.docx', '.doc']:
+            print(f"Warning: File may not be in DOCX format - {args.input_path}", file=sys.stderr)
+
+        try:
+            # Create a temporary extractor just for conversion (no API needed)
+            temp_extractor = DocxExtractor(
+                api_key="dummy",  # Not used for markdown conversion
+                use_azure=False
+            )
+
+            print(f"Converting tables to Markdown: {input_path}")
+            markdown_content = temp_extractor.convert_tables_to_markdown(str(input_path))
+
+            # Save to file or print to stdout
+            if args.output:
+                output_path = Path(args.output)
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
+                print(f"\nMarkdown content saved to: {output_path}")
+            else:
+                print("\n" + "=" * 80)
+                print("Markdown Output:")
+                print("=" * 80)
+                # Handle encoding for console output
+                try:
+                    print(markdown_content)
+                except UnicodeEncodeError:
+                    # If console doesn't support UTF-8, encode with error handling
+                    print(markdown_content.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding))
+
+            return 0
+        except Exception as e:
+            print(f"Error: Failed to convert to Markdown - {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            return 1
+
+    # Check whether to use Azure OpenAI (default is true)
+    use_azure = os.getenv("USE_AZURE_OPENAI", "true").lower() in ("true", "1", "yes")
+
+    if use_azure:
+        # Get Azure OpenAI configuration
+        api_key = args.api_key or os.getenv("AZURE_OPENAI_API_KEY")
+        azure_endpoint = args.api_base or os.getenv("AZURE_OPENAI_ENDPOINT")
+        azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+        model = args.model or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "gpt-4o"
+
+        if not api_key:
+            print("Error: Azure OpenAI API key not provided", file=sys.stderr)
+            print("Please provide the API key in one of the following ways:", file=sys.stderr)
+            print("  1. Use the --api-key parameter", file=sys.stderr)
+            print("  2. Set the AZURE_OPENAI_API_KEY environment variable", file=sys.stderr)
+            print("     Example: set AZURE_OPENAI_API_KEY=your-api-key-here", file=sys.stderr)
+            return 1
+
+        if not azure_endpoint:
+            print("Error: Azure OpenAI endpoint not provided", file=sys.stderr)
+            print("Please provide the endpoint in one of the following ways:", file=sys.stderr)
+            print("  1. Use the --api-base parameter", file=sys.stderr)
+            print("  2. Set the AZURE_OPENAI_ENDPOINT environment variable", file=sys.stderr)
+            print("     Example: set AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/", file=sys.stderr)
+            return 1
+    else:
+        # Get standard OpenAI configuration
+        api_key = args.api_key or os.getenv("OPENAI_API_KEY")
+        api_base = args.api_base or os.getenv("OPENAI_API_BASE")
+        model = args.model or os.getenv("OPENAI_MODEL") or "gpt-4o-2024-08-06"
+        azure_endpoint = None
+        azure_api_version = None
+
+        if not api_key:
+            print("Error: OpenAI API key not provided", file=sys.stderr)
+            print("Please provide the API key in one of the following ways:", file=sys.stderr)
+            print("  1. Use the --api-key parameter", file=sys.stderr)
+            print("  2. Set the OPENAI_API_KEY environment variable", file=sys.stderr)
+            print("     Example: export OPENAI_API_KEY='your-api-key-here'", file=sys.stderr)
+            return 1
+
+    # Create extractor instance
+    if use_azure:
+        extractor = DocxExtractor(
+            api_key=api_key,
+            model=model,
+            use_azure=True,
+            azure_endpoint=azure_endpoint,
+            azure_api_version=azure_api_version
+        )
+    else:
+        extractor = DocxExtractor(
+            api_key=api_key,
+            model=model,
+            api_base=api_base,
+            use_azure=False
+        )
 
     try:
-        # 判断是文件还是文件夹
+        # Determine whether it's a file or folder
         if input_path.is_file():
-            # 处理单个文件
+            # Process single file
             if input_path.suffix.lower() not in ['.docx', '.doc']:
-                print(f"警告: 文件可能不是DOCX格式 - {args.input_path}", file=sys.stderr)
+                print(f"Warning: File may not be in DOCX format - {args.input_path}", file=sys.stderr)
 
             extraction = extractor.process_file(str(input_path), args.output)
 
-            # 如果指定了 --json 标志，输出JSON格式
+            # Output JSON format if --json flag is specified
             if args.json:
                 print("\n" + "=" * 80)
-                print("JSON输出:")
+                print("JSON output:")
                 print(json.dumps(extraction.model_dump(), ensure_ascii=False, indent=2))
 
         elif input_path.is_dir():
-            # 处理文件夹中的所有DOCX文件
+            # Process all DOCX files in the folder
             docx_files = list(input_path.glob("*.docx")) + list(input_path.glob("*.doc"))
 
             if not docx_files:
-                print(f"错误: 文件夹中没有找到DOCX文件 - {args.input_path}", file=sys.stderr)
+                print(f"Error: No DOCX files found in folder - {args.input_path}", file=sys.stderr)
                 return 1
 
-            print(f"找到 {len(docx_files)} 个DOCX文件")
+            print(f"Found {len(docx_files)} DOCX file(s)")
             print("=" * 80)
 
             extractions = []
             for idx, docx_file in enumerate(docx_files, 1):
-                print(f"\n[{idx}/{len(docx_files)}] 处理文件: {docx_file.name}")
+                print(f"\n[{idx}/{len(docx_files)}] Processing file: {docx_file.name}")
                 print("-" * 80)
 
                 try:
                     extraction = extractor.process_file(str(docx_file))
                     extractions.append((docx_file.name, extraction))
                 except Exception as e:
-                    print(f"警告: 处理文件 {docx_file.name} 时出错: {e}", file=sys.stderr)
+                    print(f"Warning: Error processing file {docx_file.name}: {e}", file=sys.stderr)
                     continue
 
-            # 保存结果
+            # Save results
             if args.output:
                 output_path = Path(args.output)
                 if output_path.suffix.lower() == '.csv':
-                    # 导出为CSV
+                    # Export to CSV
                     DocxExtractor.export_to_csv(extractions, str(output_path))
-                    print(f"\n所有结果已保存到CSV文件: {output_path}")
+                    print(f"\nAll results saved to CSV file: {output_path}")
                 elif output_path.suffix.lower() == '.json':
-                    # 导出为JSON
+                    # Export to JSON
                     all_data = {
                         "files": [
                             {
@@ -446,11 +649,11 @@ def main():
                     }
                     with open(output_path, 'w', encoding='utf-8') as f:
                         json.dump(all_data, f, ensure_ascii=False, indent=2)
-                    print(f"\n所有结果已保存到JSON文件: {output_path}")
+                    print(f"\nAll results saved to JSON file: {output_path}")
                 else:
-                    print(f"警告: 不支持的输出格式 {output_path.suffix}，请使用 .csv 或 .json", file=sys.stderr)
+                    print(f"Warning: Unsupported output format {output_path.suffix}, please use .csv or .json", file=sys.stderr)
 
-            # 如果指定了 --json 标志，输出JSON格式到标准输出
+            # Output JSON format to standard output if --json flag is specified
             if args.json:
                 all_data = {
                     "files": [
@@ -462,20 +665,20 @@ def main():
                     ]
                 }
                 print("\n" + "=" * 80)
-                print("JSON输出:")
+                print("JSON output:")
                 print(json.dumps(all_data, ensure_ascii=False, indent=2))
 
         else:
-            print(f"错误: 输入路径既不是文件也不是文件夹 - {args.input_path}", file=sys.stderr)
+            print(f"Error: Input path is neither a file nor a folder - {args.input_path}", file=sys.stderr)
             return 1
 
         return 0
 
     except FileNotFoundError as e:
-        print(f"错误: 文件未找到 - {e}", file=sys.stderr)
+        print(f"Error: File not found - {e}", file=sys.stderr)
         return 1
     except Exception as e:
-        print(f"错误: 处理过程中出错 - {e}", file=sys.stderr)
+        print(f"Error: An error occurred during processing - {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         return 1
