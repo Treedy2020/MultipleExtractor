@@ -160,7 +160,7 @@ class DocxExtractor:
 
         This method extracts paragraph text and table content from the document,
         combining them into a single string. It also detects and marks cells
-        that contain images.
+        that contain images or nested tables. Only processes 5-column tables.
 
         Args:
             file_path: Path to the DOCX file (relative or absolute).
@@ -178,20 +178,38 @@ class DocxExtractor:
         # Extract all paragraph text
         paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
 
-        # Extract table content with image detection
+        # Extract table content with image and nested table detection
         tables_content = []
         for table in doc.tables:
+            # Skip tables that are not 5-column tables
+            if not self._is_valid_main_table(table):
+                print(f"  Skipping table with {len(table.rows[0].cells) if table.rows else 0} columns (expected 5)")
+                continue
+
             for row in table.rows:
                 row_data = []
                 for cell in row.cells:
                     cell_text = cell.text.strip()
+                    cell_markers = []
+
                     # Check if cell contains images
                     if self._cell_has_images(cell):
-                        # Append image marker to cell content
+                        cell_markers.append("[IMAGE: Contains label/symbol image]")
+
+                    # Check if cell contains nested tables
+                    if self._cell_has_nested_table(cell):
+                        nested_tables = self._extract_nested_tables(cell)
+                        if nested_tables:
+                            nested_content = " || ".join(nested_tables)
+                            cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
+
+                    # Combine cell text with markers
+                    if cell_markers:
                         if cell_text:
-                            cell_text += " [IMAGE: Contains label/symbol image]"
+                            cell_text += " " + " ".join(cell_markers)
                         else:
-                            cell_text = "[IMAGE: Contains label/symbol image]"
+                            cell_text = " ".join(cell_markers)
+
                     row_data.append(cell_text)
                 if any(row_data):  # Only add non-empty rows
                     tables_content.append(" | ".join(row_data))
@@ -221,6 +239,73 @@ class DocxExtractor:
                 if run._element.xpath('.//w:pict'):
                     return True
         return False
+
+    def _cell_has_nested_table(self, cell) -> bool:
+        """Check if a table cell contains nested tables.
+
+        Args:
+            cell: A docx table cell object.
+
+        Returns:
+            True if the cell contains one or more nested tables, False otherwise.
+        """
+        # Check if the cell's element contains table elements
+        return len(cell._element.xpath('.//w:tbl')) > 0
+
+    def _extract_nested_tables(self, cell) -> list[str]:
+        """Extract nested tables from a cell and format them as strings.
+
+        Args:
+            cell: A docx table cell object.
+
+        Returns:
+            List of formatted table strings, each representing a nested table.
+        """
+        nested_tables = []
+        tables = cell._element.xpath('.//w:tbl')
+
+        for tbl_element in tables:
+            # Parse the table rows
+            rows = tbl_element.xpath('.//w:tr')
+            table_rows = []
+
+            for row in rows:
+                cells = row.xpath('.//w:tc')
+                row_data = []
+                for tc in cells:
+                    # Get text from all paragraphs in the cell
+                    paragraphs = tc.xpath('.//w:p')
+                    cell_text = ' '.join([
+                        ''.join([
+                            node.text for node in p.xpath('.//w:t') if node.text
+                        ]) for p in paragraphs
+                    ]).strip()
+                    row_data.append(cell_text)
+                if any(row_data):  # Only add non-empty rows
+                    table_rows.append(' | '.join(row_data))
+
+            if table_rows:
+                nested_tables.append('\n'.join(table_rows))
+
+        return nested_tables
+
+    def _is_valid_main_table(self, table) -> bool:
+        """Check if a table is a valid 5-column main table to process.
+
+        Args:
+            table: A docx table object.
+
+        Returns:
+            True if the table has 5 columns, False otherwise.
+        """
+        if len(table.rows) == 0:
+            return False
+
+        # Check the number of columns from the first row (header row)
+        first_row = table.rows[0]
+        num_columns = len(first_row.cells)
+
+        return num_columns == 5
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -291,33 +376,62 @@ class DocxExtractor:
             if len(table.rows) == 0:
                 continue
 
-            # Extract header row with image detection
+            # Skip tables that are not 5-column tables
+            if not self._is_valid_main_table(table):
+                print(f"  Skipping table {table_idx + 1} with {len(table.rows[0].cells)} columns (expected 5)")
+                continue
+
+            # Extract header row with image and nested table detection
             header_row = table.rows[0]
             header_data = []
             for cell in header_row.cells:
                 cell_text = cell.text.strip()
+                cell_markers = []
+
                 if self._cell_has_images(cell):
+                    cell_markers.append("[IMAGE: Contains label/symbol image]")
+
+                if self._cell_has_nested_table(cell):
+                    nested_tables = self._extract_nested_tables(cell)
+                    if nested_tables:
+                        nested_content = " || ".join(nested_tables)
+                        cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
+
+                if cell_markers:
                     if cell_text:
-                        cell_text += " [IMAGE: Contains label/symbol image]"
+                        cell_text += " " + " ".join(cell_markers)
                     else:
-                        cell_text = "[IMAGE: Contains label/symbol image]"
+                        cell_text = " ".join(cell_markers)
+
                 header_data.append(cell_text)
 
             header_line = " | ".join(header_data)
             header_tokens = self.estimate_tokens(header_line)
 
-            # Extract data rows with image detection
+            # Extract data rows with image and nested table detection
             data_rows = []
             data_row_tokens = []
             for row in table.rows[1:]:  # Skip header
                 row_data = []
                 for cell in row.cells:
                     cell_text = cell.text.strip()
+                    cell_markers = []
+
                     if self._cell_has_images(cell):
+                        cell_markers.append("[IMAGE: Contains label/symbol image]")
+
+                    if self._cell_has_nested_table(cell):
+                        nested_tables = self._extract_nested_tables(cell)
+                        if nested_tables:
+                            nested_content = " || ".join(nested_tables)
+                            cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
+
+                    if cell_markers:
                         if cell_text:
-                            cell_text += " [IMAGE: Contains label/symbol image]"
+                            cell_text += " " + " ".join(cell_markers)
                         else:
-                            cell_text = "[IMAGE: Contains label/symbol image]"
+                            cell_text = " ".join(cell_markers)
+
                     row_data.append(cell_text)
                 if any(row_data):  # Only add non-empty rows
                     row_line = " | ".join(row_data)
@@ -376,11 +490,11 @@ class DocxExtractor:
         return batches
 
     def convert_tables_to_markdown(self, file_path: str) -> str:
-        """Converts all tables in a DOCX file to Markdown format.
+        """Converts all 5-column tables in a DOCX file to Markdown format.
 
-        This method extracts all tables from the document and converts them
+        This method extracts all 5-column tables from the document and converts them
         to Markdown table syntax. Non-table content is preserved as plain text.
-        It also detects and marks cells that contain images.
+        It also detects and marks cells that contain images or nested tables.
 
         Args:
             file_path: Path to the DOCX file (relative or absolute).
@@ -402,23 +516,44 @@ class DocxExtractor:
                 output.append("")  # Add blank line
 
         # Extract and convert tables to Markdown
+        valid_table_count = 0
         for table_idx, table in enumerate(doc.tables, 1):
-            output.append(f"### Table {table_idx}")
+            # Skip tables that are not 5-column tables
+            if not self._is_valid_main_table(table):
+                output.append(f"### Table {table_idx} (Skipped - {len(table.rows[0].cells) if table.rows else 0} columns, expected 5)")
+                output.append("")
+                continue
+
+            valid_table_count += 1
+            output.append(f"### Table {table_idx} (5 columns)")
             output.append("")
 
-            # Get table data with image detection
+            # Get table data with image and nested table detection
             table_data = []
             for row in table.rows:
                 row_data = []
                 for cell in row.cells:
                     cell_text = cell.text.strip()
+                    cell_markers = []
+
                     # Check if cell contains images
                     if self._cell_has_images(cell):
-                        # Append image marker to cell content
+                        cell_markers.append("[IMAGE: Contains label/symbol image]")
+
+                    # Check if cell contains nested tables
+                    if self._cell_has_nested_table(cell):
+                        nested_tables = self._extract_nested_tables(cell)
+                        if nested_tables:
+                            nested_content = " || ".join(nested_tables)
+                            cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
+
+                    # Combine cell text with markers
+                    if cell_markers:
                         if cell_text:
-                            cell_text += " [IMAGE: Contains label/symbol image]"
+                            cell_text += " " + " ".join(cell_markers)
                         else:
-                            cell_text = "[IMAGE: Contains label/symbol image]"
+                            cell_text = " ".join(cell_markers)
+
                     row_data.append(cell_text)
                 table_data.append(row_data)
 
@@ -473,21 +608,25 @@ class DocxExtractor:
                     1. TL EA: Extract the attached protocol information from Column 1
                        - Extract ALL content completely and accurately from Column 1
                        - Do not omit, summarize, or truncate any text
+                       - If Column 1 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     2. Test standard: Extract non-website content from Column 2 (test standard)
                        - Extract ALL text content from Column 2 completely
                        - Exclude only website URLs (which should go to Source link field)
                        - Do not omit, summarize, or truncate any text
+                       - If Column 2 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     3. Test analytes: Extract test analyte information ONLY from Column 5
                        - IMPORTANT: Only extract content that appears in Column 5
                        - Do NOT extract test analytes or chemical names from Column 3 (PP notes) or any other columns
                        - If Column 5 is empty, return an empty string
                        - Only use the exact content from Column 5, do not infer or analyze from other columns
                        - Extract ALL content from Column 5 completely when present
+                       - If Column 5 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     4. PP notes: Extract notes information from Column 3
                        - CRITICAL: Extract ALL content from Column 3 completely and accurately
                        - Do NOT omit any text even if it contains chemical names or test information
                        - Do NOT summarize or truncate the content
                        - Column 3 often contains detailed requirements, standards, and notes - preserve everything
+                       - If Column 3 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     5. Source link: If there is a website link in Column 2, extract it; otherwise return null
                     6. Label and symbol: This field indicates whether this row contains any label or symbol images (such as certification marks, safety labels, warning symbols, etc.).
                        - In the document, cells containing images will be marked with "[IMAGE: Contains label/symbol image]"
@@ -495,12 +634,19 @@ class DocxExtractor:
                        - If no such marker is found in the row, return "no"
                        - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
 
+                    Important notes about nested tables:
+                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: content]"
+                    - The nested table content is formatted with " | " separating columns and " || " separating multiple nested tables
+                    - When you see a nested table marker, extract the information from within it as if it were part of the cell content
+                    - The main document only processes 5-column tables - any other tables are nested within cells
+
                     Important notes:
                     - The document may contain multiple rows of data (e.g., multiple rows in a table)
                     - Please create a separate record for each row of data
                     - Put all records in the records list
                     - Please carefully analyze the document content and accurately extract this information
                     - Pay special attention to the "[IMAGE: Contains label/symbol image]" markers to determine the Label and symbol field
+                    - Pay special attention to the "[NESTED_TABLE: ...]" markers to extract content from nested tables
                     - CRITICAL: Test analytes must ONLY come from Column 5, never from other columns
                     - CRITICAL: All other columns (1, 2, 3) must be extracted COMPLETELY without omission, summarization, or truncation"""
                 },
@@ -538,21 +684,25 @@ class DocxExtractor:
                     1. TL EA: Extract the attached protocol information from Column 1
                        - Extract ALL content completely and accurately from Column 1
                        - Do not omit, summarize, or truncate any text
+                       - If Column 1 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     2. Test standard: Extract non-website content from Column 2 (test standard)
                        - Extract ALL text content from Column 2 completely
                        - Exclude only website URLs (which should go to Source link field)
                        - Do not omit, summarize, or truncate any text
+                       - If Column 2 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     3. Test analytes: Extract test analyte information ONLY from Column 5
                        - IMPORTANT: Only extract content that appears in Column 5
                        - Do NOT extract test analytes or chemical names from Column 3 (PP notes) or any other columns
                        - If Column 5 is empty, return an empty string
                        - Only use the exact content from Column 5, do not infer or analyze from other columns
                        - Extract ALL content from Column 5 completely when present
+                       - If Column 5 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     4. PP notes: Extract notes information from Column 3
                        - CRITICAL: Extract ALL content from Column 3 completely and accurately
                        - Do NOT omit any text even if it contains chemical names or test information
                        - Do NOT summarize or truncate the content
                        - Column 3 often contains detailed requirements, standards, and notes - preserve everything
+                       - If Column 3 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
                     5. Source link: If there is a website link in Column 2, extract it; otherwise return null
                     6. Label and symbol: This field indicates whether this row contains any label or symbol images (such as certification marks, safety labels, warning symbols, etc.).
                        - In the document, cells containing images will be marked with "[IMAGE: Contains label/symbol image]"
@@ -560,12 +710,19 @@ class DocxExtractor:
                        - If no such marker is found in the row, return "no"
                        - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
 
+                    Important notes about nested tables:
+                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: content]"
+                    - The nested table content is formatted with " | " separating columns and " || " separating multiple nested tables
+                    - When you see a nested table marker, extract the information from within it as if it were part of the cell content
+                    - The main document only processes 5-column tables - any other tables are nested within cells
+
                     Important notes:
                     - The document may contain multiple rows of data (e.g., multiple rows in a table)
                     - Please create a separate record for each row of data
                     - Put all records in the records list
                     - Please carefully analyze the document content and accurately extract this information
                     - Pay special attention to the "[IMAGE: Contains label/symbol image]" markers to determine the Label and symbol field
+                    - Pay special attention to the "[NESTED_TABLE: ...]" markers to extract content from nested tables
                     - CRITICAL: Test analytes must ONLY come from Column 5, never from other columns
                     - CRITICAL: All other columns (1, 2, 3) must be extracted COMPLETELY without omission, summarization, or truncation"""
                 },
