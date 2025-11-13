@@ -189,28 +189,22 @@ class DocxExtractor:
             for row in table.rows:
                 row_data = []
                 for cell in row.cells:
-                    cell_text = cell.text.strip()
-                    cell_markers = []
+                    # Check if cell contains nested tables
+                    if self._cell_has_nested_table(cell):
+                        # Extract content with tables in their original positions
+                        cell_content = self._extract_cell_content_with_tables(cell)
+                    else:
+                        # No nested tables, just get the text
+                        cell_content = cell.text.strip()
 
                     # Check if cell contains images
                     if self._cell_has_images(cell):
-                        cell_markers.append("[IMAGE: Contains label/symbol image]")
-
-                    # Check if cell contains nested tables
-                    if self._cell_has_nested_table(cell):
-                        nested_tables = self._extract_nested_tables(cell)
-                        if nested_tables:
-                            nested_content = " || ".join(nested_tables)
-                            cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
-
-                    # Combine cell text with markers
-                    if cell_markers:
-                        if cell_text:
-                            cell_text += " " + " ".join(cell_markers)
+                        if cell_content:
+                            cell_content += " [IMAGE: Contains label/symbol image]"
                         else:
-                            cell_text = " ".join(cell_markers)
+                            cell_content = "[IMAGE: Contains label/symbol image]"
 
-                    row_data.append(cell_text)
+                    row_data.append(cell_content)
                 if any(row_data):  # Only add non-empty rows
                     tables_content.append(" | ".join(row_data))
 
@@ -249,45 +243,73 @@ class DocxExtractor:
         Returns:
             True if the cell contains one or more nested tables, False otherwise.
         """
-        # Check if the cell's element contains table elements
-        return len(cell._element.xpath('.//w:tbl')) > 0
+        # Use cell.tables property to check for nested tables
+        return len(cell.tables) > 0
 
-    def _extract_nested_tables(self, cell) -> list[str]:
-        """Extract nested tables from a cell and format them as strings.
+    def _format_nested_table_as_markdown(self, table) -> str:
+        """Format a single nested table as a Markdown table.
+
+        Args:
+            table: A docx table object.
+
+        Returns:
+            Markdown-formatted table string.
+        """
+        markdown_rows = []
+
+        # Process all rows
+        for row_idx, row in enumerate(table.rows):
+            row_data = [c.text.strip() for c in row.cells]
+
+            if any(row_data):  # Only add non-empty rows
+                # Format as Markdown table row
+                markdown_rows.append('| ' + ' | '.join(row_data) + ' |')
+
+                # Add separator after first row (header)
+                if row_idx == 0 and len(row_data) > 0:
+                    markdown_rows.append('| ' + ' | '.join(['---'] * len(row_data)) + ' |')
+
+        return '\n'.join(markdown_rows) if markdown_rows else ''
+
+    def _extract_cell_content_with_tables(self, cell) -> str:
+        """Extract cell content with nested tables in their original positions.
+
+        This method preserves the order of text and tables as they appear in the cell.
+        Nested tables are converted to Markdown format and inserted at their
+        original positions in the text flow.
 
         Args:
             cell: A docx table cell object.
 
         Returns:
-            List of formatted table strings, each representing a nested table.
+            A string containing the cell content with nested tables marked and
+            positioned correctly in the original order.
         """
-        nested_tables = []
-        tables = cell._element.xpath('.//w:tbl')
+        content_parts = []
 
-        for tbl_element in tables:
-            # Parse the table rows
-            rows = tbl_element.xpath('.//w:tr')
-            table_rows = []
+        # Iterate through all elements in the cell in order
+        for element in cell._element:
+            # Check if it's a paragraph
+            if element.tag.endswith('p'):
+                # Get paragraph text
+                para_text = ''.join([
+                    node.text for node in element.xpath('.//w:t') if node.text
+                ]).strip()
+                if para_text:
+                    content_parts.append(para_text)
 
-            for row in rows:
-                cells = row.xpath('.//w:tc')
-                row_data = []
-                for tc in cells:
-                    # Get text from all paragraphs in the cell
-                    paragraphs = tc.xpath('.//w:p')
-                    cell_text = ' '.join([
-                        ''.join([
-                            node.text for node in p.xpath('.//w:t') if node.text
-                        ]) for p in paragraphs
-                    ]).strip()
-                    row_data.append(cell_text)
-                if any(row_data):  # Only add non-empty rows
-                    table_rows.append(' | '.join(row_data))
+            # Check if it's a table
+            elif element.tag.endswith('tbl'):
+                # Find the corresponding table object
+                for table in cell.tables:
+                    if table._element == element:
+                        markdown_table = self._format_nested_table_as_markdown(table)
+                        if markdown_table:
+                            content_parts.append(f"[NESTED_TABLE:\n{markdown_table}\n]")
+                        break
 
-            if table_rows:
-                nested_tables.append('\n'.join(table_rows))
-
-        return nested_tables
+        # Join all parts with appropriate spacing
+        return '\n\n'.join(content_parts) if content_parts else cell.text.strip()
 
     def _is_valid_main_table(self, table) -> bool:
         """Check if a table is a valid 5-column main table to process.
@@ -385,25 +407,22 @@ class DocxExtractor:
             header_row = table.rows[0]
             header_data = []
             for cell in header_row.cells:
-                cell_text = cell.text.strip()
-                cell_markers = []
-
-                if self._cell_has_images(cell):
-                    cell_markers.append("[IMAGE: Contains label/symbol image]")
-
+                # Check if cell contains nested tables
                 if self._cell_has_nested_table(cell):
-                    nested_tables = self._extract_nested_tables(cell)
-                    if nested_tables:
-                        nested_content = " || ".join(nested_tables)
-                        cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
+                    # Extract content with tables in their original positions
+                    cell_content = self._extract_cell_content_with_tables(cell)
+                else:
+                    # No nested tables, just get the text
+                    cell_content = cell.text.strip()
 
-                if cell_markers:
-                    if cell_text:
-                        cell_text += " " + " ".join(cell_markers)
+                # Check if cell contains images
+                if self._cell_has_images(cell):
+                    if cell_content:
+                        cell_content += " [IMAGE: Contains label/symbol image]"
                     else:
-                        cell_text = " ".join(cell_markers)
+                        cell_content = "[IMAGE: Contains label/symbol image]"
 
-                header_data.append(cell_text)
+                header_data.append(cell_content)
 
             header_line = " | ".join(header_data)
             header_tokens = self.estimate_tokens(header_line)
@@ -414,25 +433,22 @@ class DocxExtractor:
             for row in table.rows[1:]:  # Skip header
                 row_data = []
                 for cell in row.cells:
-                    cell_text = cell.text.strip()
-                    cell_markers = []
-
-                    if self._cell_has_images(cell):
-                        cell_markers.append("[IMAGE: Contains label/symbol image]")
-
+                    # Check if cell contains nested tables
                     if self._cell_has_nested_table(cell):
-                        nested_tables = self._extract_nested_tables(cell)
-                        if nested_tables:
-                            nested_content = " || ".join(nested_tables)
-                            cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
+                        # Extract content with tables in their original positions
+                        cell_content = self._extract_cell_content_with_tables(cell)
+                    else:
+                        # No nested tables, just get the text
+                        cell_content = cell.text.strip()
 
-                    if cell_markers:
-                        if cell_text:
-                            cell_text += " " + " ".join(cell_markers)
+                    # Check if cell contains images
+                    if self._cell_has_images(cell):
+                        if cell_content:
+                            cell_content += " [IMAGE: Contains label/symbol image]"
                         else:
-                            cell_text = " ".join(cell_markers)
+                            cell_content = "[IMAGE: Contains label/symbol image]"
 
-                    row_data.append(cell_text)
+                    row_data.append(cell_content)
                 if any(row_data):  # Only add non-empty rows
                     row_line = " | ".join(row_data)
                     data_rows.append(row_line)
@@ -533,28 +549,22 @@ class DocxExtractor:
             for row in table.rows:
                 row_data = []
                 for cell in row.cells:
-                    cell_text = cell.text.strip()
-                    cell_markers = []
+                    # Check if cell contains nested tables
+                    if self._cell_has_nested_table(cell):
+                        # Extract content with tables in their original positions
+                        cell_content = self._extract_cell_content_with_tables(cell)
+                    else:
+                        # No nested tables, just get the text
+                        cell_content = cell.text.strip()
 
                     # Check if cell contains images
                     if self._cell_has_images(cell):
-                        cell_markers.append("[IMAGE: Contains label/symbol image]")
-
-                    # Check if cell contains nested tables
-                    if self._cell_has_nested_table(cell):
-                        nested_tables = self._extract_nested_tables(cell)
-                        if nested_tables:
-                            nested_content = " || ".join(nested_tables)
-                            cell_markers.append(f"[NESTED_TABLE: {nested_content}]")
-
-                    # Combine cell text with markers
-                    if cell_markers:
-                        if cell_text:
-                            cell_text += " " + " ".join(cell_markers)
+                        if cell_content:
+                            cell_content += " [IMAGE: Contains label/symbol image]"
                         else:
-                            cell_text = " ".join(cell_markers)
+                            cell_content = "[IMAGE: Contains label/symbol image]"
 
-                    row_data.append(cell_text)
+                    row_data.append(cell_content)
                 table_data.append(row_data)
 
             if not table_data:
@@ -635,10 +645,13 @@ class DocxExtractor:
                        - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
 
                     Important notes about nested tables:
-                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: content]"
-                    - The nested table content is formatted with " | " separating columns and " || " separating multiple nested tables
-                    - When you see a nested table marker, extract the information from within it as if it were part of the cell content
+                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: markdown_table]"
+                    - The nested table content is formatted as Markdown tables (with | separators and --- header dividers)
+                    - Multiple nested tables in the same cell are separated by " || "
+                    - When you see a nested table marker, parse it as a Markdown table and extract the information
+                    - The nested tables should be treated as structured data - preserve the table format in your extraction
                     - The main document only processes 5-column tables - any other tables are nested within cells
+                    - Example nested table format: "| Header1 | Header2 |\n| --- | --- |\n| Data1 | Data2 |"
 
                     Important notes:
                     - The document may contain multiple rows of data (e.g., multiple rows in a table)
@@ -711,10 +724,13 @@ class DocxExtractor:
                        - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
 
                     Important notes about nested tables:
-                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: content]"
-                    - The nested table content is formatted with " | " separating columns and " || " separating multiple nested tables
-                    - When you see a nested table marker, extract the information from within it as if it were part of the cell content
+                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: markdown_table]"
+                    - The nested table content is formatted as Markdown tables (with | separators and --- header dividers)
+                    - Multiple nested tables in the same cell are separated by " || "
+                    - When you see a nested table marker, parse it as a Markdown table and extract the information
+                    - The nested tables should be treated as structured data - preserve the table format in your extraction
                     - The main document only processes 5-column tables - any other tables are nested within cells
+                    - Example nested table format: "| Header1 | Header2 |\n| --- | --- |\n| Data1 | Data2 |"
 
                     Important notes:
                     - The document may contain multiple rows of data (e.g., multiple rows in a table)
