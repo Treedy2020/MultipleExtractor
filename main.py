@@ -17,8 +17,11 @@ Typical usage examples:
     python main.py document.docx
     python main.py document.docx -o output.json
 
-    # Batch process folder and export to CSV
+    # Batch process folder and export to CSV (also creates results.json)
     python main.py ./documents -o results.csv
+
+    # Convert JSON results back to DOCX with nested tables
+    python main.py --json-to-docx results.json -o output.docx
 
     # Use custom Azure configuration
     python main.py document.docx --api-key your-azure-key --model your-deployment-name
@@ -43,6 +46,9 @@ Note:
     - Each row of data in the document will be extracted as a separate record
     - When batch processing folders, CSV format is recommended for consolidation
     - CSV output includes source filename for tracking record origins
+    - When exporting to CSV, a JSON file with the same name is also automatically created
+    - Nested tables are preserved using special markers (<<NESTED_TABLE_N_START>> ... <<NESTED_TABLE_N_END>>)
+    - Use --json-to-docx to convert JSON results back to DOCX with actual nested tables
     - Azure OpenAI is used by default, set USE_AZURE_OPENAI=false to switch to standard OpenAI
 """
 
@@ -51,11 +57,14 @@ import asyncio
 import csv
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
 
 from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from openai import AzureOpenAI, OpenAI, AsyncAzureOpenAI, AsyncOpenAI
 from pydantic import BaseModel, Field
 from tqdm import tqdm
@@ -246,14 +255,15 @@ class DocxExtractor:
         # Use cell.tables property to check for nested tables
         return len(cell.tables) > 0
 
-    def _format_nested_table_as_markdown(self, table) -> str:
-        """Format a single nested table as a Markdown table.
+    def _format_nested_table_as_markdown(self, table, table_index: int = 0) -> str:
+        """Format a single nested table as a Markdown table with special delimiters.
 
         Args:
             table: A docx table object.
+            table_index: Index of the nested table (for unique identification).
 
         Returns:
-            Markdown-formatted table string.
+            Markdown-formatted table string with special delimiters.
         """
         markdown_rows = []
 
@@ -269,14 +279,17 @@ class DocxExtractor:
                 if row_idx == 0 and len(row_data) > 0:
                     markdown_rows.append('| ' + ' | '.join(['---'] * len(row_data)) + ' |')
 
-        return '\n'.join(markdown_rows) if markdown_rows else ''
+        if markdown_rows:
+            # Wrap with special delimiters
+            return f'<<NESTED_TABLE_{table_index}_START>>\n' + '\n'.join(markdown_rows) + f'\n<<NESTED_TABLE_{table_index}_END>>'
+        return ''
 
     def _extract_cell_content_with_tables(self, cell) -> str:
         """Extract cell content with nested tables in their original positions.
 
         This method preserves the order of text and tables as they appear in the cell.
-        Nested tables are converted to Markdown format and inserted at their
-        original positions in the text flow.
+        Nested tables are converted to Markdown format with special delimiters and
+        inserted at their original positions in the text flow.
 
         Args:
             cell: A docx table cell object.
@@ -286,6 +299,7 @@ class DocxExtractor:
             positioned correctly in the original order.
         """
         content_parts = []
+        table_index = 0
 
         # Iterate through all elements in the cell in order
         for element in cell._element:
@@ -303,9 +317,10 @@ class DocxExtractor:
                 # Find the corresponding table object
                 for table in cell.tables:
                     if table._element == element:
-                        markdown_table = self._format_nested_table_as_markdown(table)
+                        markdown_table = self._format_nested_table_as_markdown(table, table_index)
                         if markdown_table:
-                            content_parts.append(f"[NESTED_TABLE:\n{markdown_table}\n]")
+                            content_parts.append(markdown_table)
+                        table_index += 1
                         break
 
         # Join all parts with appropriate spacing
@@ -592,91 +607,10 @@ class DocxExtractor:
 
         return "\n".join(output)
 
-    def extract_fields(self, text: str) -> DocumentExtraction:
-        """Extracts document fields using OpenAI structured output API.
-
-        This method sends document text to the OpenAI API and uses structured
-        output functionality to extract predefined fields. A document may contain
-        multiple rows of data, each extracted as a DocumentFields record.
-
-        Args:
-            text: Text content extracted from the DOCX document.
-
-        Returns:
-            A DocumentExtraction instance containing all extracted records.
-
-        Raises:
-            openai.APIError: If the API call fails.
-            openai.RateLimitError: If the API rate limit is exceeded.
-        """
-        completion = self.client.responses.parse(
-            model=self.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": """You are a professional document information extraction assistant. Please extract the following fields from the provided document content:
-                    1. TL EA: Extract the attached protocol information from Column 1
-                       - Extract ALL content completely and accurately from Column 1
-                       - Do not omit, summarize, or truncate any text
-                       - If Column 1 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
-                    2. Test standard: Extract non-website content from Column 2 (test standard)
-                       - Extract ALL text content from Column 2 completely
-                       - Exclude only website URLs (which should go to Source link field)
-                       - Do not omit, summarize, or truncate any text
-                       - If Column 2 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
-                    3. Test analytes: Extract test analyte information ONLY from Column 5
-                       - IMPORTANT: Only extract content that appears in Column 5
-                       - Do NOT extract test analytes or chemical names from Column 3 (PP notes) or any other columns
-                       - If Column 5 is empty, return an empty string
-                       - Only use the exact content from Column 5, do not infer or analyze from other columns
-                       - Extract ALL content from Column 5 completely when present
-                       - If Column 5 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
-                    4. PP notes: Extract notes information from Column 3
-                       - CRITICAL: Extract ALL content from Column 3 completely and accurately
-                       - Do NOT omit any text even if it contains chemical names or test information
-                       - Do NOT summarize or truncate the content
-                       - Column 3 often contains detailed requirements, standards, and notes - preserve everything
-                       - If Column 3 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
-                    5. Source link: If there is a website link in Column 2, extract it; otherwise return null
-                    6. Label and symbol: This field indicates whether this row contains any label or symbol images (such as certification marks, safety labels, warning symbols, etc.).
-                       - In the document, cells containing images will be marked with "[IMAGE: Contains label/symbol image]"
-                       - If you see this marker in any cell of the current row, return "yes"
-                       - If no such marker is found in the row, return "no"
-                       - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
-
-                    Important notes about nested tables:
-                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: markdown_table]"
-                    - The nested table content is formatted as Markdown tables (with | separators and --- header dividers)
-                    - Multiple nested tables in the same cell are separated by " || "
-                    - When you see a nested table marker, parse it as a Markdown table and extract the information
-                    - The nested tables should be treated as structured data - preserve the table format in your extraction
-                    - The main document only processes 5-column tables - any other tables are nested within cells
-                    - Example nested table format: "| Header1 | Header2 |\n| --- | --- |\n| Data1 | Data2 |"
-
-                    Important notes:
-                    - The document may contain multiple rows of data (e.g., multiple rows in a table)
-                    - Please create a separate record for each row of data
-                    - Put all records in the records list
-                    - Please carefully analyze the document content and accurately extract this information
-                    - Pay special attention to the "[IMAGE: Contains label/symbol image]" markers to determine the Label and symbol field
-                    - Pay special attention to the "[NESTED_TABLE: ...]" markers to extract content from nested tables
-                    - CRITICAL: Test analytes must ONLY come from Column 5, never from other columns
-                    - CRITICAL: All other columns (1, 2, 3) must be extracted COMPLETELY without omission, summarization, or truncation"""
-                },
-                {
-                    "role": "user",
-                    "content": f"Please extract information from all rows in the following document content:\n\n{text}"
-                }
-            ],
-            text_format=DocumentExtraction,
-        )
-
-        return completion.output_parsed
-
     async def extract_fields_async(self, text: str) -> DocumentExtraction:
         """Asynchronously extracts document fields using OpenAI structured output API.
 
-        This is the async version of extract_fields, used for batch processing.
+        This method is used for all extraction operations (batch processing).
 
         Args:
             text: Text content extracted from the DOCX document.
@@ -694,28 +628,38 @@ class DocxExtractor:
                 {
                     "role": "system",
                     "content": """You are a professional document information extraction assistant. Please extract the following fields from the provided document content:
+
+                    IMPORTANT - Table Identification:
+                    - The document may contain multiple tables, but you should ONLY process the main 5-column data table
+                    - The main target table has 5 columns: Column 1 (TL EA), Column 2 (Test Standard), Column 3 (PP Notes), Column 4, and Column 5 (Test Analytes)
+                    - IGNORE any other tables that are not the main 5-column table (e.g., auxiliary tables, summary tables, etc.)
+                    - If you encounter content from non-target tables in the input, skip them completely - do not create records for them
+                    - Only create records for rows that clearly belong to the main 5-column data table
+                    - When in doubt, check if the row has the expected 5-column structure with the fields described below
+
+                    Field Extraction Instructions:
                     1. TL EA: Extract the attached protocol information from Column 1
                        - Extract ALL content completely and accurately from Column 1
                        - Do not omit, summarize, or truncate any text
-                       - If Column 1 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
+                       - If Column 1 contains a nested table (marked with "<<NESTED_TABLE_N_START>>" ... "<<NESTED_TABLE_N_END>>"), PRESERVE the complete marker format including the delimiters and all content between them exactly as they appear
                     2. Test standard: Extract non-website content from Column 2 (test standard)
                        - Extract ALL text content from Column 2 completely
                        - Exclude only website URLs (which should go to Source link field)
                        - Do not omit, summarize, or truncate any text
-                       - If Column 2 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
+                       - If Column 2 contains a nested table (marked with "<<NESTED_TABLE_N_START>>" ... "<<NESTED_TABLE_N_END>>"), PRESERVE the complete marker format including the delimiters and all content between them exactly as they appear
                     3. Test analytes: Extract test analyte information ONLY from Column 5
                        - IMPORTANT: Only extract content that appears in Column 5
                        - Do NOT extract test analytes or chemical names from Column 3 (PP notes) or any other columns
                        - If Column 5 is empty, return an empty string
                        - Only use the exact content from Column 5, do not infer or analyze from other columns
                        - Extract ALL content from Column 5 completely when present
-                       - If Column 5 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
+                       - If Column 5 contains a nested table (marked with "<<NESTED_TABLE_N_START>>" ... "<<NESTED_TABLE_N_END>>"), PRESERVE the complete marker format including the delimiters and all content between them exactly as they appear
                     4. PP notes: Extract notes information from Column 3
                        - CRITICAL: Extract ALL content from Column 3 completely and accurately
                        - Do NOT omit any text even if it contains chemical names or test information
                        - Do NOT summarize or truncate the content
                        - Column 3 often contains detailed requirements, standards, and notes - preserve everything
-                       - If Column 3 contains a nested table (marked with "[NESTED_TABLE: ...]"), extract the content from the nested table
+                       - If Column 3 contains a nested table (marked with "<<NESTED_TABLE_N_START>>" ... "<<NESTED_TABLE_N_END>>"), PRESERVE the complete marker format including the delimiters and all content between them exactly as they appear
                     5. Source link: If there is a website link in Column 2, extract it; otherwise return null
                     6. Label and symbol: This field indicates whether this row contains any label or symbol images (such as certification marks, safety labels, warning symbols, etc.).
                        - In the document, cells containing images will be marked with "[IMAGE: Contains label/symbol image]"
@@ -724,13 +668,15 @@ class DocxExtractor:
                        - Note: The label/symbol refers to visual graphics or icons embedded in the document, not just text descriptions
 
                     Important notes about nested tables:
-                    - Some cells may contain nested tables, marked with "[NESTED_TABLE: markdown_table]"
-                    - The nested table content is formatted as Markdown tables (with | separators and --- header dividers)
-                    - Multiple nested tables in the same cell are separated by " || "
-                    - When you see a nested table marker, parse it as a Markdown table and extract the information
-                    - The nested tables should be treated as structured data - preserve the table format in your extraction
+                    - Some cells may contain nested tables, marked with special delimiters: "<<NESTED_TABLE_N_START>>" and "<<NESTED_TABLE_N_END>>" where N is the table index
+                    - The nested table content between delimiters is formatted as Markdown tables (with | separators and --- header dividers)
+                    - Multiple nested tables in the same cell will have different indices (0, 1, 2, etc.)
+                    - CRITICAL: You MUST preserve these special markers EXACTLY as they appear in your output
+                    - DO NOT parse, interpret, summarize, or convert the nested tables - just copy them verbatim with their delimiters
+                    - The markers are special tokens that will be processed later to recreate actual nested tables in the final output
+                    - Include the complete content: start delimiter, Markdown table content, and end delimiter
+                    - Example: If you see "<<NESTED_TABLE_0_START>>\n| Header1 | Header2 |\n| --- | --- |\n| Data1 | Data2 |\n<<NESTED_TABLE_0_END>>", you must output it EXACTLY as is in your extraction result
                     - The main document only processes 5-column tables - any other tables are nested within cells
-                    - Example nested table format: "| Header1 | Header2 |\n| --- | --- |\n| Data1 | Data2 |"
 
                     Important notes:
                     - The document may contain multiple rows of data (e.g., multiple rows in a table)
@@ -738,7 +684,9 @@ class DocxExtractor:
                     - Put all records in the records list
                     - Please carefully analyze the document content and accurately extract this information
                     - Pay special attention to the "[IMAGE: Contains label/symbol image]" markers to determine the Label and symbol field
-                    - Pay special attention to the "[NESTED_TABLE: ...]" markers to extract content from nested tables
+                    - CRITICAL: PRESERVE all "<<NESTED_TABLE_N_START>>" ... "<<NESTED_TABLE_N_END>>" markers EXACTLY as they appear
+                    - DO NOT parse, interpret, or convert the nested table markers - copy them verbatim
+                    - The markers (<<NESTED_TABLE_N_START>> and <<NESTED_TABLE_N_END>>) are special tokens that must be preserved exactly in your output
                     - CRITICAL: Test analytes must ONLY come from Column 5, never from other columns
                     - CRITICAL: All other columns (1, 2, 3) must be extracted COMPLETELY without omission, summarization, or truncation"""
                 },
@@ -802,6 +750,182 @@ class DocxExtractor:
         return DocumentExtraction(records=combined_records)
 
     @staticmethod
+    def _parse_nested_tables(text: str) -> list[tuple[str, str, str]]:
+        """Parse nested table markers from text and return list of (start_marker, end_marker, content).
+
+        Args:
+            text: Text containing nested table markers.
+
+        Returns:
+            List of tuples containing (start_marker, end_marker, table_content).
+        """
+        pattern = r'<<NESTED_TABLE_(\d+)_START>>\n(.*?)\n<<NESTED_TABLE_\1_END>>'
+        matches = re.finditer(pattern, text, re.DOTALL)
+
+        result = []
+        for match in matches:
+            table_index = match.group(1)
+            table_content = match.group(2)
+            start_marker = f'<<NESTED_TABLE_{table_index}_START>>'
+            end_marker = f'<<NESTED_TABLE_{table_index}_END>>'
+            result.append((start_marker, end_marker, table_content))
+
+        return result
+
+    @staticmethod
+    def _markdown_to_docx_table(doc_or_cell, markdown_table: str):
+        """Convert a Markdown table string to a DOCX table.
+
+        Args:
+            doc_or_cell: A Document or table cell object where the table should be added.
+            markdown_table: Markdown-formatted table string.
+
+        Returns:
+            The created table object.
+        """
+        # Parse markdown table
+        lines = [line.strip() for line in markdown_table.strip().split('\n') if line.strip()]
+
+        # Remove separator line (the one with ---)
+        data_lines = [line for line in lines if not re.match(r'^\|\s*-+\s*(\|\s*-+\s*)*\|$', line)]
+
+        # Parse rows
+        rows_data = []
+        for line in data_lines:
+            # Remove leading/trailing pipes and split by pipe
+            cells = [cell.strip() for cell in line.strip('|').split('|')]
+            rows_data.append(cells)
+
+        if not rows_data:
+            return None
+
+        # Create table
+        num_rows = len(rows_data)
+        num_cols = len(rows_data[0]) if rows_data else 0
+
+        table = doc_or_cell.add_table(rows=num_rows, cols=num_cols)
+        table.style = 'Table Grid'
+
+        # Fill table data
+        for i, row_data in enumerate(rows_data):
+            for j, cell_data in enumerate(row_data):
+                if j < len(table.rows[i].cells):
+                    table.rows[i].cells[j].text = cell_data
+                    # Make header row bold
+                    if i == 0:
+                        for paragraph in table.rows[i].cells[j].paragraphs:
+                            for run in paragraph.runs:
+                                run.font.bold = True
+
+        return table
+
+    @staticmethod
+    def _add_text_with_nested_tables(cell, text: str):
+        """Add text and nested tables to a cell, parsing special markers.
+
+        Args:
+            cell: A table cell object.
+            text: Text that may contain nested table markers.
+        """
+        # Find all nested tables
+        nested_tables = DocxExtractor._parse_nested_tables(text)
+
+        if not nested_tables:
+            # No nested tables, just add the text
+            cell.text = text
+            return
+
+        # Split text by nested table markers and reconstruct
+        remaining_text = text
+
+        # Clear existing content
+        cell.text = ''
+
+        for start_marker, end_marker, table_content in nested_tables:
+            # Find the position of this nested table
+            full_marker = f'{start_marker}\n{table_content}\n{end_marker}'
+
+            if full_marker in remaining_text:
+                # Split by this marker
+                before, _, after = remaining_text.partition(full_marker)
+
+                # Add text before the table
+                if before.strip():
+                    cell.add_paragraph(before.strip())
+
+                # Add the nested table
+                DocxExtractor._markdown_to_docx_table(cell, table_content)
+
+                # Continue with remaining text
+                remaining_text = after
+
+        # Add any remaining text after the last table
+        if remaining_text.strip():
+            cell.add_paragraph(remaining_text.strip())
+
+    @staticmethod
+    def export_to_docx(extraction: DocumentExtraction, output_path: str, source_file: Optional[str] = None) -> None:
+        """Export extraction results to a DOCX file with nested tables.
+
+        Args:
+            extraction: DocumentExtraction object containing the extracted records.
+            output_path: Output DOCX file path.
+            source_file: Optional source filename to include in the header.
+
+        Raises:
+            IOError: If unable to write to the file.
+        """
+        doc = Document()
+
+        # Add title
+        title = doc.add_heading('Document Extraction Results', 0)
+        title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+        # Add source file info if provided
+        if source_file:
+            info_para = doc.add_paragraph()
+            info_para.add_run('Source File: ').bold = True
+            info_para.add_run(source_file)
+            doc.add_paragraph()  # Blank line
+
+        # Create main table with headers
+        main_table = doc.add_table(rows=1, cols=6)
+        main_table.style = 'Table Grid'
+
+        # Set header row
+        header_cells = main_table.rows[0].cells
+        headers = ['TL EA', 'Test Standard', 'Test Analytes', 'PP Notes', 'Source Link', 'Label and Symbol']
+
+        for i, header in enumerate(headers):
+            header_cells[i].text = header
+            # Make header bold
+            for paragraph in header_cells[i].paragraphs:
+                for run in paragraph.runs:
+                    run.font.bold = True
+                    run.font.size = Pt(11)
+
+        # Add data rows
+        for record in extraction.records:
+            row_cells = main_table.add_row().cells
+
+            # Process each field and add to cell
+            fields = [
+                record.tl_ea,
+                record.test_standard,
+                record.test_analytes,
+                record.pp_notes,
+                record.source_link or '',
+                record.label_and_symbol
+            ]
+
+            for i, field_value in enumerate(fields):
+                if field_value:
+                    DocxExtractor._add_text_with_nested_tables(row_cells[i], field_value)
+
+        # Save document
+        doc.save(output_path)
+
+    @staticmethod
     def export_to_csv(extractions: list[tuple[str, DocumentExtraction]], output_path: str) -> None:
         """Exports multiple extraction results to a CSV file.
 
@@ -838,60 +962,6 @@ class DocxExtractor:
                         record.source_link or '',
                         record.label_and_symbol
                     ])
-
-    def process_file(self, file_path: str, output_path: Optional[str] = None) -> DocumentExtraction:
-        """Processes a DOCX file and extracts structured information.
-
-        This is the main workflow method that reads the DOCX file, extracts fields,
-        and optionally saves the results to a JSON file. Processing progress and
-        results are printed to standard output. The document may contain multiple
-        rows of data, each of which will be extracted.
-
-        Args:
-            file_path: Input DOCX file path (relative or absolute).
-            output_path: Optional output JSON file path. If provided, results will
-                be saved in JSON format.
-
-        Returns:
-            A DocumentExtraction instance containing all extracted records.
-
-        Raises:
-            FileNotFoundError: If the input file does not exist.
-            openai.APIError: If the OpenAI API call fails.
-            IOError: If unable to write to the output file.
-        """
-        print(f"Reading file: {file_path}")
-        text = self.read_docx(file_path)
-
-        print(f"Document content length: {len(text)} characters")
-        print("\nExtracting structured information using OpenAI...")
-
-        extraction = self.extract_fields(text)
-
-        print("\nExtraction complete!")
-        print("=" * 80)
-        print(f"Total records extracted: {len(extraction.records)}\n")
-
-        for idx, record in enumerate(extraction.records, 1):
-            print(f"Record #{idx}")
-            print("-" * 80)
-            print(f"  TL EA:           {record.tl_ea}")
-            print(f"  Test standard:   {record.test_standard}")
-            print(f"  Test analytes:   {record.test_analytes}")
-            print(f"  PP notes:        {record.pp_notes}")
-            print(f"  Source link:     {record.source_link}")
-            print(f"  Label & symbol:  {record.label_and_symbol}")
-            print()
-
-        print("=" * 80)
-
-        # Save as JSON if output path is specified
-        if output_path:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(extraction.model_dump(), f, ensure_ascii=False, indent=2)
-            print(f"\nResults saved to: {output_path}")
-
-        return extraction
 
     def process_file_with_batches(
         self,
@@ -954,11 +1024,23 @@ class DocxExtractor:
         # Save based on file extension
         if output_path:
             output_path_obj = Path(output_path)
+            filename = Path(file_path).name
+
             if output_path_obj.suffix.lower() == '.csv':
-                # Export to CSV - use filename from file_path
-                filename = Path(file_path).name
+                # Export to CSV
                 DocxExtractor.export_to_csv([(filename, extraction)], output_path)
                 print(f"\nResults saved to CSV: {output_path}")
+
+                # Also save JSON with same base name
+                json_path = output_path_obj.with_suffix('.json')
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(extraction.model_dump(), f, ensure_ascii=False, indent=2)
+                print(f"Results also saved to JSON: {json_path}")
+
+            elif output_path_obj.suffix.lower() == '.docx':
+                # Export to DOCX
+                DocxExtractor.export_to_docx(extraction, output_path, filename)
+                print(f"\nResults saved to DOCX: {output_path}")
             else:
                 # Default to JSON
                 with open(output_path, 'w', encoding='utf-8') as f:
@@ -968,6 +1050,55 @@ class DocxExtractor:
         return extraction
 
 
+def json_to_docx(json_path: str, output_path: str) -> None:
+    """Convert a JSON extraction result file to DOCX format.
+
+    Args:
+        json_path: Path to the input JSON file.
+        output_path: Path to the output DOCX file.
+
+    Raises:
+        FileNotFoundError: If the JSON file does not exist.
+        json.JSONDecodeError: If the JSON file is malformed.
+        IOError: If unable to write to the output file.
+    """
+    # Read JSON file
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Check if it's a single-file or multi-file JSON
+    if 'files' in data:
+        # Multi-file format - create a document for each file
+        for file_data in data['files']:
+            filename = file_data['filename']
+            records = file_data['records']
+
+            # Create extraction object
+            extraction = DocumentExtraction(records=[DocumentFields(**r) for r in records])
+
+            # Generate output filename
+            base_name = Path(filename).stem
+            output_file = Path(output_path).parent / f"{Path(output_path).stem}_{base_name}.docx"
+
+            # Export to DOCX
+            DocxExtractor.export_to_docx(extraction, str(output_file), filename)
+            print(f"Exported {filename} to {output_file}")
+
+    elif 'records' in data:
+        # Single-file format
+        extraction = DocumentExtraction(records=[DocumentFields(**r) for r in data['records']])
+
+        # Get source filename from JSON path
+        source_file = Path(json_path).stem
+
+        # Export to DOCX
+        DocxExtractor.export_to_docx(extraction, output_path, source_file)
+        print(f"Exported to {output_path}")
+
+    else:
+        raise ValueError("Invalid JSON format: expected 'records' or 'files' key")
+
+
 def parse_args() -> argparse.Namespace:
     """Parses command line arguments.
 
@@ -975,121 +1106,156 @@ def parse_args() -> argparse.Namespace:
         A Namespace object containing the parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Extract structured information from DOCX documents, supports single file or batch folder processing",
+        description="DOCX Document Information Extraction Tool - Extract structured data from Word documents",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Process a single file
-  %(prog)s document.docx
-  %(prog)s document.docx -o output.json
+OPERATION MODES:
+  The tool has three main operation modes:
 
-  # Process all DOCX files in a folder and export to CSV
-  %(prog)s ./documents -o results.csv
+  1. EXTRACT MODE (default) - Extract information from DOCX files
+     %(prog)s INPUT_FILE -o OUTPUT_FILE
+     %(prog)s INPUT_FOLDER -o OUTPUT_FILE
 
-  # Use batch mode for concurrent processing with progress bar
-  %(prog)s document.docx --batch-mode --batch-size 10 --max-concurrent 5
-  %(prog)s ./documents --batch-mode -o results.csv
+  2. CONVERT MODE - Convert between formats without AI processing
+     %(prog)s INPUT_FILE --mode convert --format markdown -o OUTPUT_FILE
+     %(prog)s INPUT_JSON --mode convert --format docx -o OUTPUT_FILE
 
-  # Convert DOCX tables to Markdown (no AI processing)
-  %(prog)s document.docx --to-markdown
-  %(prog)s document.docx --to-markdown -o output.md
+  3. Both modes support single file or batch folder processing
 
-  # Use custom API configuration
-  %(prog)s document.docx --api-key your-api-key --model gpt-4o
-  %(prog)s document.docx --api-base https://api.openai.com/v1
+EXAMPLES:
 
-Batch Mode:
-  When --batch-mode is enabled, the tool splits tables by rows and processes
-  them concurrently with async API calls. This is useful for large documents
-  with many table rows, as it can significantly speed up processing while
-  maintaining consistent table headers across all batches. Progress is shown
-  via a progress bar.
+  Basic Extraction:
+    %(prog)s document.docx -o results.csv          # Extract to CSV+JSON
+    %(prog)s document.docx -o results.json         # Extract to JSON only
+    %(prog)s ./docs -o results.csv                 # Batch process folder
 
-Environment variables (Azure OpenAI - enabled by default):
-  USE_AZURE_OPENAI           Whether to use Azure OpenAI (default: true)
-  AZURE_OPENAI_API_KEY       Azure OpenAI API key
-  AZURE_OPENAI_ENDPOINT      Azure OpenAI endpoint URL
-  AZURE_OPENAI_API_VERSION   Azure OpenAI API version (default: 2024-08-01-preview)
-  AZURE_OPENAI_DEPLOYMENT    Azure OpenAI deployment name (default: gpt-4o)
+  Advanced Extraction (customize batch processing):
+    %(prog)s document.docx -o results.csv --batch-size 20      # Adjust max rows per batch
+    %(prog)s document.docx -o results.csv --concurrency 10     # Adjust concurrent API calls
+    %(prog)s document.docx -o results.csv --max-tokens 25000   # Adjust token limit per batch
 
-Environment variables (Standard OpenAI - when USE_AZURE_OPENAI=false):
-  OPENAI_API_KEY     OpenAI API key (if not specified via --api-key)
-  OPENAI_API_BASE    OpenAI API base URL (if not specified via --api-base)
-  OPENAI_MODEL       OpenAI model name (if not specified via --model, default: gpt-4o-2024-08-06)
+  Format Conversion:
+    %(prog)s document.docx --mode convert --format markdown -o output.md
+    %(prog)s results.json --mode convert --format docx -o output.docx
+
+  Custom API Configuration:
+    %(prog)s document.docx -o results.csv --api-key KEY --model gpt-4o
+    %(prog)s document.docx -o results.csv --api-base https://api.example.com
+
+OUTPUT FORMATS:
+  .csv   - CSV with source filename (auto-creates .json for nested table preservation)
+  .json  - JSON with complete structure and nested table markers
+  .docx  - Word document with actual embedded nested tables (convert mode only)
+  .md    - Markdown format (convert mode only)
+
+ENVIRONMENT VARIABLES:
+  Azure OpenAI (default):
+    USE_AZURE_OPENAI=true              # Enable Azure OpenAI (default)
+    AZURE_OPENAI_API_KEY=<key>         # API key
+    AZURE_OPENAI_ENDPOINT=<url>        # Endpoint URL
+    AZURE_OPENAI_API_VERSION=<ver>     # API version (default: 2024-08-01-preview)
+    AZURE_OPENAI_DEPLOYMENT=<name>     # Deployment name (default: gpt-4o)
+
+  Standard OpenAI:
+    USE_AZURE_OPENAI=false             # Use standard OpenAI
+    OPENAI_API_KEY=<key>               # API key
+    OPENAI_API_BASE=<url>              # API base URL (optional)
+    OPENAI_MODEL=<model>               # Model name (default: gpt-4o-2024-08-06)
+
+NOTES:
+  - Always uses smart batch processing to prevent output truncation
+  - Automatically processes multiple rows together within token limits
+  - CSV output automatically creates a JSON file for nested table preservation
+  - Nested tables use markers: <<NESTED_TABLE_N_START>>...<<NESTED_TABLE_N_END>>
+  - Use convert mode to transform JSON back to DOCX with actual nested tables
+  - Only the main 5-column table is processed; other tables in the document are ignored
         """
     )
 
+    # Positional argument
     parser.add_argument(
-        "input_path",
+        "input",
         type=str,
-        help="Input DOCX file path or folder path containing DOCX files"
+        nargs='?',
+        default=None,
+        metavar="INPUT",
+        help="Input file or folder path (DOCX for extraction, JSON for conversion)"
     )
 
-    parser.add_argument(
+    # Output options
+    output_group = parser.add_argument_group('Output Options')
+    output_group.add_argument(
         "-o", "--output",
         type=str,
-        default=None,
-        help="Output file path (.json or .csv format). CSV format is recommended for folder processing"
+        metavar="FILE",
+        help="Output file path (.csv, .json, .docx, or .md)"
     )
-
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="API key (Azure mode: AZURE_OPENAI_API_KEY, OpenAI mode: OPENAI_API_KEY)"
-    )
-
-    parser.add_argument(
-        "--api-base",
-        type=str,
-        default=None,
-        help="API endpoint URL (Azure mode: AZURE_OPENAI_ENDPOINT, OpenAI mode: OPENAI_API_BASE)"
-    )
-
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Model/deployment name (Azure mode: AZURE_OPENAI_DEPLOYMENT, OpenAI mode: OPENAI_MODEL)"
-    )
-
-    parser.add_argument(
-        "--json",
+    output_group.add_argument(
+        "--stdout",
         action="store_true",
-        help="Output in JSON format to standard output"
+        help="Print JSON output to stdout (in addition to file output)"
     )
 
-    parser.add_argument(
-        "--to-markdown",
-        action="store_true",
-        help="Convert DOCX tables to Markdown format (no AI processing)"
+    # Operation mode
+    mode_group = parser.add_argument_group('Operation Mode')
+    mode_group.add_argument(
+        "--mode",
+        type=str,
+        choices=['extract', 'convert'],
+        default='extract',
+        help="Operation mode: 'extract' (AI extraction) or 'convert' (format conversion). Default: extract"
+    )
+    mode_group.add_argument(
+        "--format",
+        type=str,
+        choices=['markdown', 'docx'],
+        metavar="FORMAT",
+        help="Target format for convert mode: 'markdown' or 'docx'"
     )
 
-    parser.add_argument(
-        "--batch-mode",
-        action="store_true",
-        help="Enable batch processing mode: split tables by rows and process concurrently"
-    )
-
-    parser.add_argument(
+    # Processing options
+    process_group = parser.add_argument_group('Processing Options')
+    process_group.add_argument(
         "--batch-size",
         type=int,
         default=10,
-        help="Number of table rows per batch (default: 10)"
+        metavar="N",
+        help="Max rows per batch (default: 10). Actual batch size may be smaller due to token limits."
     )
-
-    parser.add_argument(
-        "--max-concurrent",
+    process_group.add_argument(
+        "--concurrency",
         type=int,
         default=5,
-        help="Maximum number of concurrent API calls (default: 5)"
+        metavar="N",
+        help="Max concurrent API calls (default: 5)"
     )
-
-    parser.add_argument(
+    process_group.add_argument(
         "--max-tokens",
         type=int,
         default=20000,
-        help="Maximum input tokens per batch (default: 20000). Prevents output truncation by limiting input size."
+        metavar="N",
+        help="Max input tokens per batch (default: 20000). Controls smart batching behavior."
+    )
+
+    # API configuration
+    api_group = parser.add_argument_group('API Configuration')
+    api_group.add_argument(
+        "--api-key",
+        type=str,
+        metavar="KEY",
+        help="API key (overrides environment variables)"
+    )
+    api_group.add_argument(
+        "--api-base",
+        type=str,
+        metavar="URL",
+        help="API endpoint URL (overrides environment variables)"
+    )
+    api_group.add_argument(
+        "--model",
+        type=str,
+        metavar="NAME",
+        help="Model or deployment name (overrides environment variables)"
     )
 
     return parser.parse_args()
@@ -1108,55 +1274,76 @@ def main():
     """
     args = parse_args()
 
-    # Validate input path
-    input_path = Path(args.input_path)
-    if not input_path.exists():
-        print(f"Error: Path does not exist - {args.input_path}", file=sys.stderr)
+    # Validate input
+    if not args.input:
+        print("Error: INPUT is required", file=sys.stderr)
+        print("Run 'python main.py --help' for usage information", file=sys.stderr)
         return 1
 
-    # Handle --to-markdown option (no API required)
-    if args.to_markdown:
-        if not input_path.is_file():
-            print("Error: --to-markdown only supports single file conversion", file=sys.stderr)
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Error: Path does not exist - {args.input}", file=sys.stderr)
+        return 1
+
+    # ========== CONVERT MODE ==========
+    if args.mode == 'convert':
+        if not args.format:
+            print("Error: --format is required when using --mode convert", file=sys.stderr)
+            print("Available formats: markdown, docx", file=sys.stderr)
             return 1
 
-        if input_path.suffix.lower() not in ['.docx', '.doc']:
-            print(f"Warning: File may not be in DOCX format - {args.input_path}", file=sys.stderr)
+        if not args.output:
+            print("Error: --output (-o) is required when using --mode convert", file=sys.stderr)
+            return 1
 
-        try:
-            # Create a temporary extractor just for conversion (no API needed)
-            temp_extractor = DocxExtractor(
-                api_key="dummy",  # Not used for markdown conversion
-                use_azure=False
-            )
+        # Convert DOCX to Markdown
+        if args.format == 'markdown':
+            if not input_path.is_file():
+                print("Error: Markdown conversion only supports single file", file=sys.stderr)
+                return 1
 
-            print(f"Converting tables to Markdown: {input_path}")
-            markdown_content = temp_extractor.convert_tables_to_markdown(str(input_path))
+            if input_path.suffix.lower() not in ['.docx', '.doc']:
+                print(f"Warning: File may not be in DOCX format - {args.input}", file=sys.stderr)
 
-            # Save to file or print to stdout
-            if args.output:
-                output_path = Path(args.output)
-                with open(output_path, 'w', encoding='utf-8') as f:
+            try:
+                # Create a temporary extractor just for conversion (no API needed)
+                temp_extractor = DocxExtractor(
+                    api_key="dummy",  # Not used for markdown conversion
+                    use_azure=False
+                )
+
+                print(f"Converting tables to Markdown: {input_path}")
+                markdown_content = temp_extractor.convert_tables_to_markdown(str(input_path))
+
+                # Save to file
+                with open(args.output, 'w', encoding='utf-8') as f:
                     f.write(markdown_content)
-                print(f"\nMarkdown content saved to: {output_path}")
-            else:
-                print("\n" + "=" * 80)
-                print("Markdown Output:")
-                print("=" * 80)
-                # Handle encoding for console output
-                try:
-                    print(markdown_content)
-                except UnicodeEncodeError:
-                    # If console doesn't support UTF-8, encode with error handling
-                    print(markdown_content.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding))
+                print(f"Markdown content saved to: {args.output}")
+                return 0
+            except Exception as e:
+                print(f"Error: Failed to convert to Markdown - {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+                return 1
 
-            return 0
-        except Exception as e:
-            print(f"Error: Failed to convert to Markdown - {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
-            return 1
+        # Convert JSON to DOCX
+        elif args.format == 'docx':
+            if input_path.suffix.lower() != '.json':
+                print("Error: DOCX conversion requires JSON input file", file=sys.stderr)
+                return 1
 
+            try:
+                print(f"Converting JSON to DOCX: {input_path}")
+                json_to_docx(str(input_path), args.output)
+                print("Conversion complete!")
+                return 0
+            except Exception as e:
+                print(f"Error: Failed to convert JSON to DOCX - {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+                return 1
+
+    # ========== EXTRACT MODE ==========
     # Check whether to use Azure OpenAI (default is true)
     use_azure = os.getenv("USE_AZURE_OPENAI", "true").lower() in ("true", "1", "yes")
 
@@ -1220,22 +1407,19 @@ def main():
         if input_path.is_file():
             # Process single file
             if input_path.suffix.lower() not in ['.docx', '.doc']:
-                print(f"Warning: File may not be in DOCX format - {args.input_path}", file=sys.stderr)
+                print(f"Warning: File may not be in DOCX format - {args.input}", file=sys.stderr)
 
-            # Choose processing method based on batch mode flag
-            if args.batch_mode:
-                extraction = extractor.process_file_with_batches(
-                    str(input_path),
-                    batch_size=args.batch_size,
-                    max_concurrent=args.max_concurrent,
-                    max_tokens_per_batch=args.max_tokens,
-                    output_path=args.output
-                )
-            else:
-                extraction = extractor.process_file(str(input_path), args.output)
+            # Always use batch processing (smart batching)
+            extraction = extractor.process_file_with_batches(
+                str(input_path),
+                batch_size=args.batch_size,
+                max_concurrent=args.concurrency,
+                max_tokens_per_batch=args.max_tokens,
+                output_path=args.output
+            )
 
-            # Output JSON format if --json flag is specified
-            if args.json:
+            # Output JSON format if --stdout flag is specified
+            if args.stdout:
                 print("\n" + "=" * 80)
                 print("JSON output:")
                 print(json.dumps(extraction.model_dump(), ensure_ascii=False, indent=2))
@@ -1245,12 +1429,11 @@ def main():
             docx_files = list(input_path.glob("*.docx")) + list(input_path.glob("*.doc"))
 
             if not docx_files:
-                print(f"Error: No DOCX files found in folder - {args.input_path}", file=sys.stderr)
+                print(f"Error: No DOCX files found in folder - {args.input}", file=sys.stderr)
                 return 1
 
             print(f"Found {len(docx_files)} DOCX file(s)")
-            if args.batch_mode:
-                print(f"Batch mode enabled: {args.batch_size} rows per batch, {args.max_concurrent} max concurrent")
+            print(f"Processing settings: {args.batch_size} max rows/batch, {args.concurrency} max concurrent calls")
             print("=" * 80)
 
             extractions = []
@@ -1259,15 +1442,12 @@ def main():
                 print("-" * 80)
 
                 try:
-                    if args.batch_mode:
-                        extraction = extractor.process_file_with_batches(
-                            str(docx_file),
-                            batch_size=args.batch_size,
-                            max_concurrent=args.max_concurrent,
-                            max_tokens_per_batch=args.max_tokens
-                        )
-                    else:
-                        extraction = extractor.process_file(str(docx_file))
+                    extraction = extractor.process_file_with_batches(
+                        str(docx_file),
+                        batch_size=args.batch_size,
+                        max_concurrent=args.concurrency,
+                        max_tokens_per_batch=args.max_tokens
+                    )
                     extractions.append((docx_file.name, extraction))
                 except Exception as e:
                     print(f"Warning: Error processing file {docx_file.name}: {e}", file=sys.stderr)
@@ -1280,6 +1460,30 @@ def main():
                     # Export to CSV
                     DocxExtractor.export_to_csv(extractions, str(output_path))
                     print(f"\nAll results saved to CSV file: {output_path}")
+
+                    # Also save JSON with same base name
+                    json_path = output_path.with_suffix('.json')
+                    all_data = {
+                        "files": [
+                            {
+                                "filename": filename,
+                                "records": extraction.model_dump()["records"]
+                            }
+                            for filename, extraction in extractions
+                        ]
+                    }
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump(all_data, f, ensure_ascii=False, indent=2)
+                    print(f"All results also saved to JSON file: {json_path}")
+
+                elif output_path.suffix.lower() == '.docx':
+                    # Export to DOCX - create separate files for each source
+                    for filename, extraction in extractions:
+                        base_name = Path(filename).stem
+                        output_file = output_path.parent / f"{output_path.stem}_{base_name}.docx"
+                        DocxExtractor.export_to_docx(extraction, str(output_file), filename)
+                        print(f"Exported {filename} to {output_file}")
+                    print(f"\nAll results saved to DOCX files in: {output_path.parent}")
                 elif output_path.suffix.lower() == '.json':
                     # Export to JSON
                     all_data = {
@@ -1295,10 +1499,10 @@ def main():
                         json.dump(all_data, f, ensure_ascii=False, indent=2)
                     print(f"\nAll results saved to JSON file: {output_path}")
                 else:
-                    print(f"Warning: Unsupported output format {output_path.suffix}, please use .csv or .json", file=sys.stderr)
+                    print(f"Warning: Unsupported output format {output_path.suffix}, please use .csv, .json, or .docx", file=sys.stderr)
 
-            # Output JSON format to standard output if --json flag is specified
-            if args.json:
+            # Output JSON format to standard output if --stdout flag is specified
+            if args.stdout:
                 all_data = {
                     "files": [
                         {
@@ -1313,7 +1517,7 @@ def main():
                 print(json.dumps(all_data, ensure_ascii=False, indent=2))
 
         else:
-            print(f"Error: Input path is neither a file nor a folder - {args.input_path}", file=sys.stderr)
+            print(f"Error: Input path is neither a file nor a folder - {args.input}", file=sys.stderr)
             return 1
 
         return 0
